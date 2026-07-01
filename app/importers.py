@@ -460,14 +460,14 @@ def _cr_kind(name, type_, industry):
     return "other"
 
 
-def parse_credit_report_text(text):
-    """Extract open accounts + collections from a full credit report (PDF text).
+def _account_last4(raw):
+    """Trailing digits of a masked account number ('xxxxxx 0036' -> '0036')."""
+    digits = re.findall(r"(\d{2,})", raw or "")
+    return digits[-1][-4:] if digits else ""
 
-    Handles the tradeline layout used by Experian-fed screening reports
-    (SafeRent etc.): credit reports carry no APR or due day, so those default
-    to 0/1 and the review step lets the user fill them in. Zero-balance
-    accounts are skipped — there's nothing to pay off.
-    """
+
+def _parse_screening_report(text):
+    """The tradeline layout used by Experian-fed screening reports (SafeRent etc.)."""
     debts = []
     heads = list(_CR_TRADELINE_HEAD.finditer(text))
     for i, m in enumerate(heads):
@@ -487,13 +487,15 @@ def parse_credit_report_text(text):
             "min_payment": _cr_money("Payment", block) or 0,
             "term_months": None, "due_day": 1,
             "kind": _cr_kind(name, type_, industry),
+            "account_last4": _account_last4(_cr_field("Account\\s*#", block)),
         })
     # Collections: anchored on "Balance Due" with a collection marker nearby.
     # The creditor's name renders as the leading text of the rows between the
     # "Creditor:" label and the balance line (the left column of the layout).
     for m in re.finditer(r"(?<![A-Za-z])Balance Due\s*:\s*\$?\s*" + MONEY_RE, text, re.I):
         window = text[max(0, m.start() - 500):m.start()]
-        if not re.search(r"collection", window + text[m.end():m.end() + 200], re.I):
+        after = text[m.end():m.end() + 300]
+        if not re.search(r"collection", window + after, re.I):
             continue
         balance = float(m.group(1).replace(",", ""))
         if not balance:
@@ -506,12 +508,145 @@ def parse_credit_report_text(text):
                 if lead:
                     parts.append(lead)
         name = " ".join(parts)[:50] or _cr_field("Collection Agency", window) or "Collection account"
-        entry = {
+        debts.append({
             "name": f"{name} (collection)"[:60], "balance": balance, "apr": 0,
             "min_payment": 0, "term_months": None, "due_day": 1, "kind": "other",
-        }
-        if all(abs(d["balance"] - balance) > 0.01 or d["name"] != entry["name"] for d in debts):
-            debts.append(entry)
+            "account_last4": _account_last4(_cr_field("Account/Serial\\s*#", window + after)),
+        })
+    return debts
+
+
+# Consumer bureau reports ("Three Bureau Credit Report", Equifax/Experian/
+# TransUnion side-by-side columns) list accounts as numbered subsections
+# ("4.1 Ed Financial/esa") with one labeled row per field and up to three
+# values per row (one per bureau).
+_TB_SUBHEAD = re.compile(r"^[ \t\f]*\d+\.\d+\s+([A-Za-z][A-Za-z&'./ -]{1,50}?)\s*(\(CLOSED\))?\s*$", re.M)
+_TB_KINDS = (("student", "student_loan"), ("auto", "auto_loan"), ("creditcard", "credit_card"),
+             ("credit card", "credit_card"), ("mortgage", "mortgage"), ("medical", "medical"))
+
+
+def _tb_money_max(label, block):
+    """Largest dollar value on the field's row (bureaus can disagree; be conservative)."""
+    vals = []
+    for m in re.finditer(label + r"((?:\s+(?:\$[\d,]+(?:\.\d{1,2})?|N/A)){1,3})", block):
+        vals += [float(tok[1:].replace(",", "")) for tok in m.group(1).split() if tok.startswith("$")]
+    return max(vals) if vals else None
+
+
+def _parse_bureau_report(text):
+    debts = []
+    heads = list(_TB_SUBHEAD.finditer(text))
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else min(len(text), m.end() + 6000)
+        block = text[m.end():end]
+        balance = _tb_money_max("Reported Balance", block) or _tb_money_max(r"\bBalance\b", block)
+        if not balance:
+            continue
+        name = re.sub(r"\s+", " ", m.group(1)).strip()
+        loan_type = ""
+        lt = re.search(r"Loan Type\s+([A-Za-z ]+)", block)
+        if lt:
+            loan_type = next((t for t in lt.group(1).split() if t.upper() != "N/A"), "")
+        term = re.search(r"Term Duration\s+(\d+)", block)
+        acct = re.search(r"Account Number\s+([^\n]+)", block)
+        kind = next((k for key, k in _TB_KINDS if key in loan_type.lower()), "other")
+        is_collection = "collection" in loan_type.lower() or bool(m.group(2))
+        debts.append({
+            "name": name[:60] + (" (collection)" if is_collection and "collection" not in name.lower() else ""),
+            "balance": balance, "apr": 0,
+            "min_payment": _tb_money_max("Monthly Payment Amount", block) or 0,
+            "term_months": int(term.group(1)) if term and int(term.group(1)) > 1 else None,
+            "due_day": 1, "kind": kind,
+            "account_last4": _account_last4(acct.group(1) if acct else ""),
+        })
+    return debts
+
+
+# Typical APRs by debt type, used only when the document carries no rate
+# (credit reports never do). Flagged apr_estimated so the review step and
+# any later merge know the number is a guess, not data.
+APR_ESTIMATES = {"credit_card": 24.0, "auto_loan": 10.0, "student_loan": 6.5,
+                 "personal": 12.0, "mortgage": 7.0}
+
+
+def _norm_debt_name(name):
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower().replace("(collection)", ""))
+
+
+def debts_match(a, b):
+    """Same real-world debt? Used to consolidate across documents and imports.
+
+    Signals, strongest first: equal account last-4; overlapping masked account
+    digits plus a corroborating name or balance; long shared name prefix;
+    shared name words plus a near-equal balance.
+    """
+    l1 = (a.get("account_last4") or "").lstrip("0")
+    l2 = (b.get("account_last4") or "").lstrip("0")
+    n1, n2 = _norm_debt_name(a.get("name")), _norm_debt_name(b.get("name"))
+    prefix = 0
+    for c1, c2 in zip(n1, n2):
+        if c1 != c2:
+            break
+        prefix += 1
+    b1, b2 = float(a.get("balance") or 0), float(b.get("balance") or 0)
+    close = b1 > 0 and b2 > 0 and abs(b1 - b2) <= 0.15 * max(b1, b2)
+    if l1 and l2 and (l1.endswith(l2) or l2.endswith(l1)):
+        if l1 == l2 and len(l1) >= 3:
+            return True
+        if prefix >= 4 or close:
+            return True
+    if prefix >= 8:
+        return True
+    if close:
+        if prefix >= 5:
+            return True
+        # word-level overlap survives renames like "UAS/College Ave Studen"
+        # vs "College Avenue Stude"
+        w1 = {w for w in re.findall(r"[a-z0-9]{4,}", (a.get("name") or "").lower())}
+        w2 = {w for w in re.findall(r"[a-z0-9]{4,}", (b.get("name") or "").lower())}
+        hits = sum(1 for x in w1 for y in w2 if x == y or x in y or y in x)
+        if hits >= 2:
+            return True
+    return False
+
+
+def _consolidate(debts):
+    """Merge entries that describe the same debt (bureaus list them repeatedly)."""
+    merged = []
+    for d in debts:
+        dup = next((m for m in merged if debts_match(d, m)), None)
+        if not dup:
+            merged.append(dict(d))
+            continue
+        # keep the richer record, fill gaps from the other
+        if not dup.get("min_payment") and d.get("min_payment"):
+            dup["min_payment"] = d["min_payment"]
+        if dup.get("kind") == "other" and d.get("kind") != "other":
+            dup["kind"] = d["kind"]
+        if not dup.get("term_months") and d.get("term_months"):
+            dup["term_months"] = d["term_months"]
+        if not dup.get("account_last4") and d.get("account_last4"):
+            dup["account_last4"] = d["account_last4"]
+        dup["balance"] = max(dup["balance"], d["balance"])
+        if len(_norm_debt_name(d["name"])) > len(_norm_debt_name(dup["name"])) and "collection" not in d["name"].lower():
+            dup["name"] = d["name"]
+    return merged
+
+
+def parse_credit_report_text(text):
+    """Extract accounts + collections from a credit report's text (PDF or paste).
+
+    Handles screening-report tradelines and three-bureau consumer reports.
+    Duplicate listings of the same debt are consolidated. Credit reports never
+    carry APRs, so a typical rate for the debt type is filled in and flagged
+    apr_estimated for the review step. Zero-balance accounts are skipped.
+    """
+    debts = _parse_screening_report(text) or _parse_bureau_report(text)
+    debts = _consolidate(debts)
+    for d in debts:
+        if not d["apr"] and "collection" not in d["name"].lower() and d["kind"] in APR_ESTIMATES:
+            d["apr"] = APR_ESTIMATES[d["kind"]]
+            d["apr_estimated"] = True
     return debts
 
 

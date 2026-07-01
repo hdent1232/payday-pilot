@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS debts(
     min_payment REAL NOT NULL DEFAULT 0,
     term_months INTEGER,
     due_day     INTEGER NOT NULL DEFAULT 1,
-    notes       TEXT NOT NULL DEFAULT ''
+    notes       TEXT NOT NULL DEFAULT '',
+    account_last4 TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS bills(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +81,11 @@ def connect():
     conn = sqlite3.connect(os.path.join(data_dir(), "data.db"))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    try:  # migration for databases created before account matching existed
+        conn.execute("ALTER TABLE debts ADD COLUMN account_last4 TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
@@ -123,17 +129,18 @@ def upsert_debt(conn, d):
         "term_months": int(d["term_months"]) if d.get("term_months") else None,
         "due_day": max(1, min(28, int(d.get("due_day") or 1))),
         "notes": d.get("notes") or "",
+        "account_last4": d.get("account_last4") or "",
     }
     if d.get("id"):
         conn.execute(
             "UPDATE debts SET name=?, kind=?, balance=?, apr=?, min_payment=?, "
-            "term_months=?, due_day=?, notes=? WHERE id=?",
+            "term_months=?, due_day=?, notes=?, account_last4=? WHERE id=?",
             (*fields.values(), d["id"]),
         )
     else:
         conn.execute(
-            "INSERT INTO debts(name, kind, balance, apr, min_payment, term_months, due_day, notes) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO debts(name, kind, balance, apr, min_payment, term_months, due_day, "
+            "notes, account_last4) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
             tuple(fields.values()),
         )
     conn.commit()

@@ -234,6 +234,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not debts:
                     debts = importers.parse_debts_text(text)
                     source = "text"
+                # flag debts we already track so the import updates them
+                # instead of creating duplicates
+                existing = db.list_debts(conn)
+                for d in debts:
+                    m = next((e for e in existing if importers.debts_match(d, e)), None)
+                    if m:
+                        d["match_id"], d["match_name"] = m["id"], m["name"]
                 self._json({"debts": debts, "source": source})
             elif route == "/api/bills":
                 for b in (body if isinstance(body, list) else [body]):

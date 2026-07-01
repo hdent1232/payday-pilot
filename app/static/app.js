@@ -344,18 +344,24 @@ $("#debt-import-parse").addEventListener("click", async () => {
     return;
   }
   const sourceLabel = { csv: "CSV", report: "credit report" }[source] || "text scan";
-  el.innerHTML = `<p class="muted small">Found ${debts.length} account(s) (${sourceLabel}).
-      Review, fix anything that's off, then confirm:</p>
+  const updates = debts.filter((d) => d.match_id).length;
+  el.innerHTML = `<p class="muted small">Found ${debts.length} account(s) (${sourceLabel})${
+      updates ? ` — <b>${updates}</b> match debts you already track and will be updated, not duplicated` : ""}.
+      Review, fix anything that's off, then confirm.
+      APRs marked <i>est.</i> are typical rates for that debt type (credit reports don't list rates) — edit to your real rate:</p>
     <table class="table"><thead><tr><th></th><th>Name</th><th class="num">Balance</th>
-      <th class="num">APR %</th><th class="num">Min payment</th></tr></thead><tbody>` +
+      <th class="num">APR %</th><th class="num">Min payment</th><th>Action</th></tr></thead><tbody>` +
     debts.map((d, i) => `<tr>
       <td><input type="checkbox" checked data-i="${i}"></td>
       <td><input value="${esc(d.name)}" data-f="name" data-i="${i}"></td>
       <td class="num"><input type="number" step="0.01" value="${d.balance}" data-f="balance" data-i="${i}" style="width:110px"></td>
-      <td class="num"><input type="number" step="0.01" value="${d.apr}" data-f="apr" data-i="${i}" style="width:80px"></td>
+      <td class="num"><input type="number" step="0.01" value="${d.apr}" data-f="apr" data-i="${i}" style="width:80px">${
+        d.apr_estimated ? "<span class='muted small'> est.</span>" : ""}</td>
       <td class="num"><input type="number" step="0.01" value="${d.min_payment}" data-f="min_payment" data-i="${i}" style="width:100px"></td>
+      <td class="small">${d.match_id ? `updates <b>${esc(d.match_name)}</b>` : "new"}</td>
     </tr>`).join("") +
-    `</tbody></table><button class="primary" id="debt-import-confirm">Add selected debts</button>`;
+    `</tbody></table><button class="primary" id="debt-import-confirm">${
+      updates ? "Add & update selected debts" : "Add selected debts"}</button>`;
   el._debts = debts;
   $("#debt-import-confirm").addEventListener("click", async () => {
     const rows = el._debts.map((d, i) => ({ ...d }));
@@ -367,9 +373,29 @@ $("#debt-import-parse").addEventListener("click", async () => {
       if (cb.checked) selected.push(rows[Number(cb.dataset.i)]);
     });
     if (!selected.length) { toast("Nothing selected."); return; }
-    await api("/api/debts", selected);
+    let added = 0, updated = 0;
+    const payload = selected.map((row) => {
+      const ex = row.match_id && STATE.debts.find((d) => d.id === row.match_id);
+      if (!ex) { added++; return row; }
+      updated++;
+      // reconcile: new document wins for balance/payment/term, but never
+      // overwrite a real APR or the user's name/due day with guesses
+      return {
+        ...row,
+        id: ex.id,
+        name: ex.name,
+        apr: ex.apr > 0 && (row.apr_estimated || !row.apr) ? ex.apr : row.apr,
+        min_payment: row.min_payment || ex.min_payment,
+        kind: row.kind !== "other" ? row.kind : ex.kind,
+        term_months: row.term_months || ex.term_months,
+        due_day: ex.due_day,
+        account_last4: row.account_last4 || ex.account_last4,
+        notes: ex.notes,
+      };
+    });
+    await api("/api/debts", payload);
     el.innerHTML = ""; $("#debt-import-text").value = "";
-    toast(`Added ${selected.length} debt(s).`);
+    toast(`${added ? `Added ${added} debt(s). ` : ""}${updated ? `Updated ${updated} existing debt(s).` : ""}`.trim());
     await loadState(); loadProjection();
   });
 });

@@ -29,10 +29,16 @@ Everything runs 100% locally — your financial data never leaves your computer.
 **Debts & payoff planning**
 - Track every debt: balance, APR, minimum payment, term, due day.
 - Import debts straight from your credit report: upload the **PDF report
-  itself** (Experian, SafeRent and other tenant-screening reports — open
-  accounts and collections are extracted on your device), paste copied text
-  (Credit Karma / Experian / etc.), or use a CSV — found accounts are shown
-  for review before anything is saved.
+  itself** (Experian/SafeRent screening reports and three-bureau consumer
+  reports — open accounts and collections are extracted on your device),
+  paste copied text (Credit Karma / Experian / etc.), or use a CSV — found
+  accounts are shown for review before anything is saved.
+- Import as many documents as you like: accounts are **consolidated, not
+  duplicated** — the app matches debts across documents (masked account
+  numbers, names, balances) and updates the ones you already track.
+- Credit reports never list interest rates, so a typical APR for each debt
+  type is filled in and marked as an estimate — your real rate always wins
+  once you set it.
 - Avalanche (highest APR first — saves the most interest) vs snowball
   (smallest balance first — fastest wins) vs minimums-only comparison, with
   debt-free dates, total interest, payoff order and a balance chart.

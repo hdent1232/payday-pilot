@@ -91,6 +91,48 @@ Date Account Name Account Number
 """
 
 
+# Mimics a "Three Bureau Credit Report" (Equifax/Experian/TransUnion columns,
+# numbered account subsections). Fake data. The collection is listed twice —
+# under installments (closed, sold) and under other accounts — like real
+# reports do; the importer must consolidate it.
+TB_REPORT_TEXT = """Jun 06, 2026 Three Bureau Credit Report powered by Equifax
+2. Revolving Accounts
+
+2.1 Example Bank Card
+ Reported                              Yes                     Yes                            Yes
+ Account Number                        xxxxxxxx 5010           xxxxxxxx 5010                  xxxxxxxx 5010
+ Reported Balance                      $450                    $450                           $450
+Account Details
+ Account Type                          Revolving               Revolving                      Revolving
+ Loan Type                             creditcard              creditcard                     creditcard
+ Term Duration                         0                       0                              0
+ Credit Limit                          $800                    $800                           $800
+ Monthly Payment Amount                $25                     $25                            $25
+
+4. Installment Accounts
+
+4.1 Example Auto Finance
+ Account Number                        xxxxxx 77               xxxxxx 77                      xxxxxx 77
+ Reported Balance                      $8,000                  $8,100                         $8,000
+ Loan Type                             automobile              automobile                     automobile
+ Term Duration                         48                      48                             48
+ Monthly Payment Amount                $310                    $310                           $310
+
+4.2 Example Collections Co (CLOSED)
+ Account Number                        xxxxx 55                N/A                            xxxxx 55
+ Reported Balance                      $900                    N/A                            $900
+ Loan Type                             collectionattorney      N/A                            N/A
+ Term Duration                         1                       N/A                            N/A
+ Monthly Payment Amount                $0                      N/A                            N/A
+
+5. Other Accounts
+
+5.1 Example Collections Co
+ Account Number                        xxxxx 55                N/A                            xxxxx 55
+ Reported Balance                      $900                    N/A                            $900
+"""
+
+
 class SmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -224,6 +266,14 @@ class SmokeTest(unittest.TestCase):
         for key in ("settings", "debts", "bills", "paychecks", "transactions", "rules"):
             self.assertIn(key, export)
 
+        # -- importing a report again matches the debts we already track
+        #    (consolidation instead of duplicates)
+        self.call("/api/debts", report["debts"])
+        again = self.call("/api/debts/import", {"text": SCREENING_REPORT_TEXT})
+        self.assertEqual(report["source"], "report")
+        self.assertTrue(all(d.get("match_id") for d in again["debts"]),
+                        [d["name"] for d in again["debts"] if not d.get("match_id")])
+
 
 STATEMENT_TEXT = """
 INVESTMENT REPORT
@@ -324,6 +374,37 @@ class CreditReportParseTest(unittest.TestCase):
         self.assertEqual(collection["balance"], 842.0)
         # paid-off account skipped — nothing to pay down
         self.assertNotIn("PAIDOFF CARD CO", by_name)
+
+    def test_three_bureau_report(self):
+        from app.importers import parse_credit_report_text
+        debts = parse_credit_report_text(TB_REPORT_TEXT)
+        by_name = {d["name"]: d for d in debts}
+        self.assertEqual(len(debts), 3, [d["name"] for d in debts])
+        card = by_name["Example Bank Card"]
+        self.assertEqual((card["balance"], card["kind"], card["account_last4"]),
+                         (450.0, "credit_card", "5010"))
+        self.assertEqual(card["apr"], 24.0)          # typical rate, flagged
+        self.assertTrue(card["apr_estimated"])       # as an estimate
+        auto = by_name["Example Auto Finance"]
+        self.assertEqual((auto["balance"], auto["min_payment"], auto["term_months"], auto["kind"]),
+                         (8100.0, 310.0, 48, "auto_loan"))  # max across bureaus
+        col = by_name["Example Collections Co"]
+        self.assertEqual((col["balance"], col["apr"]), (900.0, 0))  # merged, no APR guess
+
+    def test_debts_match(self):
+        from app.importers import debts_match
+        # masked account digits overlap + same balance
+        self.assertTrue(debts_match(
+            {"name": "Westlake Financial Svc", "balance": 9302, "account_last4": "0036"},
+            {"name": "Westlake Service Inc", "balance": 9302, "account_last4": "36"}))
+        # renamed across bureaus: shared words + same balance, no account info
+        self.assertTrue(debts_match(
+            {"name": "UAS/College Ave Studen", "balance": 31397},
+            {"name": "College Avenue Stude", "balance": 31397}))
+        # different cards stay separate
+        self.assertFalse(debts_match(
+            {"name": "Chase Freedom Visa", "balance": 3204},
+            {"name": "Capital One Visa", "balance": 2450}))
 
     def test_ignores_plain_text_and_disclosures(self):
         from app.importers import parse_credit_report_text

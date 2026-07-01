@@ -779,11 +779,13 @@
     return "other";
   }
 
-  // Mirrors importers.parse_credit_report_text — extracts open accounts and
-  // collections from full credit-report text. Credit reports carry no APR or
-  // due day, so those default to 0/1 for the review step. Zero-balance
-  // accounts are skipped — there's nothing to pay off.
-  function parseCreditReportText(text) {
+  function accountLast4(raw) {
+    const digits = (raw || "").match(/\d{2,}/g);
+    return digits ? digits[digits.length - 1].slice(-4) : "";
+  }
+
+  // The tradeline layout used by Experian-fed screening reports (SafeRent etc.).
+  function parseScreeningReport(text) {
     const debts = [];
     const heads = [...text.matchAll(CR_TRADELINE_HEAD)];
     heads.forEach((m, i) => {
@@ -800,6 +802,7 @@
         min_payment: crMoney("Payment", block) || 0,
         term_months: null, due_day: 1,
         kind: crKind(name, crField("Type", block), crField("Industry", block)),
+        account_last4: accountLast4(crField("Account\\s*#", block)),
       });
     });
     // Collections: anchored on "Balance Due" with a collection marker nearby.
@@ -807,7 +810,8 @@
     // "Creditor:" label and the balance line (the left column of the layout).
     for (const m of text.matchAll(new RegExp("(?<![A-Za-z])Balance Due\\s*:\\s*\\$?\\s*" + MONEY_RE, "gi"))) {
       const win = text.slice(Math.max(0, m.index - 500), m.index);
-      if (!/collection/i.test(win + text.slice(m.index, m.index + 200))) continue;
+      const after = text.slice(m.index, m.index + 300);
+      if (!/collection/i.test(win + after)) continue;
       const balance = Number(m[1].replace(/,/g, ""));
       if (!balance) continue;
       const creds = [...win.matchAll(/Creditor\s*:/gi)];
@@ -820,12 +824,131 @@
         }
       }
       const name = parts.join(" ").slice(0, 50) || crField("Collection Agency", win) || "Collection account";
-      const entry = {
+      debts.push({
         name: (name + " (collection)").slice(0, 60), balance, apr: 0,
         min_payment: 0, term_months: null, due_day: 1, kind: "other",
-      };
-      if (debts.every((d) => Math.abs(d.balance - balance) > 0.01 || d.name !== entry.name)) {
-        debts.push(entry);
+        account_last4: accountLast4(crField("Account/Serial\\s*#", win + after)),
+      });
+    }
+    return debts;
+  }
+
+  // Consumer bureau reports ("Three Bureau Credit Report", Equifax/Experian/
+  // TransUnion side-by-side columns) list accounts as numbered subsections
+  // ("4.1 Ed Financial/esa") with one labeled row per field and up to three
+  // values per row (one per bureau).
+  const TB_SUBHEAD = /^[ \t\f]*\d+\.\d+\s+([A-Za-z][A-Za-z&'./ -]{1,50}?)\s*(\(CLOSED\))?\s*$/gm;
+  const TB_KINDS = [["student", "student_loan"], ["auto", "auto_loan"], ["creditcard", "credit_card"],
+    ["credit card", "credit_card"], ["mortgage", "mortgage"], ["medical", "medical"]];
+
+  // Largest dollar value on the field's row (bureaus can disagree; be conservative).
+  function tbMoneyMax(label, block) {
+    const vals = [];
+    for (const m of block.matchAll(new RegExp(label + "((?:\\s+(?:\\$[\\d,]+(?:\\.\\d{1,2})?|N/A)){1,3})", "g"))) {
+      for (const tok of m[1].trim().split(/\s+/)) {
+        if (tok.startsWith("$")) vals.push(Number(tok.slice(1).replace(/,/g, "")));
+      }
+    }
+    return vals.length ? Math.max(...vals) : null;
+  }
+
+  function parseBureauReport(text) {
+    const debts = [];
+    const heads = [...text.matchAll(TB_SUBHEAD)];
+    heads.forEach((m, i) => {
+      const start = m.index + m[0].length;
+      const end = i + 1 < heads.length ? heads[i + 1].index : Math.min(text.length, start + 6000);
+      const block = text.slice(start, end);
+      const balance = tbMoneyMax("Reported Balance", block) || tbMoneyMax("\\bBalance\\b", block);
+      if (!balance) return;
+      const name = m[1].replace(/\s+/g, " ").trim();
+      const lt = block.match(/Loan Type\s+([A-Za-z ]+)/);
+      const loanType = lt ? (lt[1].trim().split(/\s+/).find((t) => t.toUpperCase() !== "N/A") || "") : "";
+      const term = block.match(/Term Duration\s+(\d+)/);
+      const acct = block.match(/Account Number\s+([^\n]+)/);
+      const kindHit = TB_KINDS.find(([key]) => loanType.toLowerCase().includes(key));
+      const isCollection = loanType.toLowerCase().includes("collection") || Boolean(m[2]);
+      debts.push({
+        name: name.slice(0, 60) + (isCollection && !name.toLowerCase().includes("collection") ? " (collection)" : ""),
+        balance, apr: 0,
+        min_payment: tbMoneyMax("Monthly Payment Amount", block) || 0,
+        term_months: term && Number(term[1]) > 1 ? Number(term[1]) : null,
+        due_day: 1, kind: kindHit ? kindHit[1] : "other",
+        account_last4: accountLast4(acct ? acct[1] : ""),
+      });
+    });
+    return debts;
+  }
+
+  // Typical APRs by debt type, used only when the document carries no rate
+  // (credit reports never do). Flagged apr_estimated so the review step and
+  // any later merge know the number is a guess, not data.
+  const APR_ESTIMATES = { credit_card: 24.0, auto_loan: 10.0, student_loan: 6.5,
+    personal: 12.0, mortgage: 7.0 };
+
+  function normDebtName(name) {
+    return (name || "").toLowerCase().replace("(collection)", "").replace(/[^a-z0-9]/g, "");
+  }
+
+  // Same real-world debt? Used to consolidate across documents and imports.
+  // Signals, strongest first: equal account last-4; overlapping masked account
+  // digits plus a corroborating name or balance; long shared name prefix;
+  // shared name words plus a near-equal balance.
+  function debtsMatch(a, b) {
+    const l1 = (a.account_last4 || "").replace(/^0+/, "");
+    const l2 = (b.account_last4 || "").replace(/^0+/, "");
+    const n1 = normDebtName(a.name), n2 = normDebtName(b.name);
+    let prefix = 0;
+    while (prefix < n1.length && prefix < n2.length && n1[prefix] === n2[prefix]) prefix++;
+    const b1 = Number(a.balance) || 0, b2 = Number(b.balance) || 0;
+    const close = b1 > 0 && b2 > 0 && Math.abs(b1 - b2) <= 0.15 * Math.max(b1, b2);
+    if (l1 && l2 && (l1.endsWith(l2) || l2.endsWith(l1))) {
+      if (l1 === l2 && l1.length >= 3) return true;
+      if (prefix >= 4 || close) return true;
+    }
+    if (prefix >= 8) return true;
+    if (close) {
+      if (prefix >= 5) return true;
+      // word-level overlap survives renames like "UAS/College Ave Studen"
+      // vs "College Avenue Stude"
+      const w1 = (a.name || "").toLowerCase().match(/[a-z0-9]{4,}/g) || [];
+      const w2 = (b.name || "").toLowerCase().match(/[a-z0-9]{4,}/g) || [];
+      let hits = 0;
+      for (const x of w1) for (const y of w2) if (x === y || x.includes(y) || y.includes(x)) hits++;
+      if (hits >= 2) return true;
+    }
+    return false;
+  }
+
+  // Merge entries that describe the same debt (bureaus list them repeatedly).
+  function consolidateDebts(debts) {
+    const merged = [];
+    for (const d of debts) {
+      const dup = merged.find((m) => debtsMatch(d, m));
+      if (!dup) { merged.push(Object.assign({}, d)); continue; }
+      if (!dup.min_payment && d.min_payment) dup.min_payment = d.min_payment;
+      if (dup.kind === "other" && d.kind !== "other") dup.kind = d.kind;
+      if (!dup.term_months && d.term_months) dup.term_months = d.term_months;
+      if (!dup.account_last4 && d.account_last4) dup.account_last4 = d.account_last4;
+      dup.balance = Math.max(dup.balance, d.balance);
+      if (normDebtName(d.name).length > normDebtName(dup.name).length && !d.name.toLowerCase().includes("collection")) {
+        dup.name = d.name;
+      }
+    }
+    return merged;
+  }
+
+  // Mirrors importers.parse_credit_report_text: screening tradelines or
+  // three-bureau consumer reports, consolidated, with typical APRs filled in
+  // and flagged apr_estimated (credit reports never carry rates).
+  function parseCreditReportText(text) {
+    let debts = parseScreeningReport(text);
+    if (!debts.length) debts = parseBureauReport(text);
+    debts = consolidateDebts(debts);
+    for (const d of debts) {
+      if (!d.apr && !d.name.toLowerCase().includes("collection") && APR_ESTIMATES[d.kind]) {
+        d.apr = APR_ESTIMATES[d.kind];
+        d.apr_estimated = true;
       }
     }
     return debts;
@@ -953,6 +1076,7 @@
       term_months: d.term_months ? Math.trunc(Number(d.term_months)) : null,
       due_day: Math.max(1, Math.min(28, Math.trunc(Number(d.due_day)) || 1)),
       notes: d.notes || "",
+      account_last4: d.account_last4 || "",
     };
     if (d.id) {
       const existing = db.debts.find((x) => x.id === Number(d.id));
@@ -1151,6 +1275,13 @@
         let source = "csv";
         if (!debts.length) { debts = parseCreditReportText(text); source = "report"; }
         if (!debts.length) { debts = parseDebtsText(text); source = "text"; }
+        // flag debts we already track so the import updates them instead of
+        // creating duplicates
+        const existing = listDebts(db);
+        for (const d of debts) {
+          const m = existing.find((e) => debtsMatch(d, e));
+          if (m) { d.match_id = m.id; d.match_name = m.name; }
+        }
         return { debts, source };
       }
 
@@ -1222,6 +1353,7 @@
     },
     // exposed for tests
     _internals: { buildPlan, simulatePayoff, spendingSummary, parseBankCsv, parseDebtsCsv,
-      parseDebtsText, parseCreditReportText, parseStatementText, nextDueDate, estimateMonthlyExtra },
+      parseDebtsText, parseCreditReportText, parseStatementText, nextDueDate, estimateMonthlyExtra,
+      debtsMatch, consolidateDebts },
   };
 })();
