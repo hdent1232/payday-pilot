@@ -211,6 +211,14 @@ class SmokeTest(unittest.TestCase):
         self.assertTrue(spend["suggestions"])  # dining etc. should trigger cut suggestions
         self.assertIn("2026-05", spend["income_by_month"])
 
+        # -- projection now carries cut-and-reallocate advice from spending
+        proj = self.call("/api/projection")
+        advice = proj["advice"]
+        self.assertTrue(advice and advice["suggestions"])
+        self.assertGreater(advice["monthly_freed"], 0)
+        self.assertTrue(advice["target_debt"])
+        self.assertIn("months", advice["boosted"])
+
         # -- export contains everything
         export = self.call("/api/export")
         for key in ("settings", "debts", "bills", "paychecks", "transactions", "rules"):
@@ -322,6 +330,42 @@ class CreditReportParseTest(unittest.TestCase):
         self.assertEqual(parse_credit_report_text(CREDIT_REPORT_TEXT), [])
         self.assertEqual(parse_credit_report_text("A Summary of Your Rights Under the "
                                                   "Fair Credit Reporting Act"), [])
+
+
+class AdviceTest(unittest.TestCase):
+    def test_stuck_debts_name_the_reason(self):
+        from app.engine import simulate_payoff
+        debts = [
+            {"id": 1, "name": "Collection", "balance": 1000, "apr": 0, "min_payment": 0, "due_day": 1},
+            {"id": 2, "name": "Toxic card", "balance": 5000, "apr": 36.0, "min_payment": 20, "due_day": 1},
+        ]
+        r = simulate_payoff(debts, "avalanche", 0)
+        self.assertTrue(r["stuck"])
+        reasons = {d["name"]: d["reason"] for d in r["stuck_debts"]}
+        self.assertEqual(reasons["Collection"], "no_payment")
+        self.assertEqual(reasons["Toxic card"], "interest")
+        # with enough extra, both clear and stuck_debts empties
+        ok = simulate_payoff(debts, "avalanche", 500)
+        self.assertFalse(ok["stuck"])
+        self.assertEqual(ok["stuck_debts"], [])
+
+    def test_income_estimated_from_imported_statements(self):
+        from app.engine import estimate_monthly_extra
+        settings = {"monthly_net_income": "0", "pay_frequency": "biweekly",
+                    "variable_budget": "400", "fun_pct": "0"}
+        txns = [
+            {"date": "2026-05-01", "amount": 2000.0, "category": "Income"},
+            {"date": "2026-05-15", "amount": 2000.0, "category": "Income"},
+            {"date": "2026-06-01", "amount": 2000.0, "category": "Income"},
+            {"date": "2026-06-15", "amount": 2000.0, "category": "Income"},
+            {"date": "2026-06-20", "amount": -50.0, "category": "Dining"},
+        ]
+        b = estimate_monthly_extra([], [], settings, [], txns)
+        self.assertEqual(b["monthly_income"], 4000.0)
+        self.assertEqual(b["monthly_extra"], 3600.0)
+        # settings/paycheck income still wins when present
+        b2 = estimate_monthly_extra([], [], settings | {"monthly_net_income": "3000"}, [], txns)
+        self.assertEqual(b2["monthly_income"], 3000.0)
 
 
 class EngineTest(unittest.TestCase):

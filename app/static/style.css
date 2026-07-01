@@ -135,6 +135,12 @@ input[type=file] { padding: 6px; }
 .bar-fill.disc { background: var(--yellow); }
 .bar-row .val { text-align: right; font-variant-numeric: tabular-nums; }
 
+.findmoney {
+  border: 1px solid rgba(213, 168, 255, .35); border-radius: 8px;
+  padding: 10px 12px; margin: 10px 0;
+}
+.findmoney h3 { margin: 0 0 6px; font-size: 14px; }
+
 .compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 10px; }
 .compare .card .value { font-size: 18px; }
 .winner { outline: 2px solid var(--green); }

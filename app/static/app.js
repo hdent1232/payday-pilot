@@ -132,7 +132,9 @@ async function loadDashOutlook() {
     const s = p.comparison[STATE.settings.strategy];
     const minOnly = p.comparison.minimum_only;
     if (s.stuck) {
-      el.innerHTML = "<div class='warnbox'>⚠️ Current payments don't keep up with interest. Increase income or cut expenses so the balance can fall.</div>";
+      el.innerHTML = "<div class='warnbox'>⚠️ At the current payments your debts never get paid down. " +
+        "Open the <b>Debts</b> tab — the payoff plan there shows which debts are stuck and " +
+        "which spending to cut to fix it.</div>";
       return;
     }
     let html = `<div class="cards">
@@ -390,7 +392,7 @@ async function loadProjection() {
   const fmt = (r, label) => {
     if (r.stuck || !r.months) {
       return `<div class="card bad"><div class="label">${label}</div>
-        <div class="value">never</div><div class="sub">payments don't cover interest</div></div>`;
+        <div class="value">never</div><div class="sub">balance never reaches zero</div></div>`;
     }
     return `<div class="card ${label.toLowerCase().includes(STATE.settings.strategy) ? "winner" : ""}">
       <div class="label">${label}</div>
@@ -405,6 +407,43 @@ async function loadProjection() {
   <p class="muted small">Using ${money(p.extra_used)}/month extra toward debt. Your selected strategy:
     <b>${STATE.settings.strategy}</b> (change in Settings).</p>`;
   const active = c[STATE.settings.strategy];
+  if (active.stuck && active.stuck_debts) {
+    const nopay = active.stuck_debts.filter((d) => d.reason === "no_payment").map((d) => esc(d.name));
+    const interest = active.stuck_debts.filter((d) => d.reason === "interest").map((d) => esc(d.name));
+    const why = [];
+    if (nopay.length) {
+      why.push(`nothing is being paid toward <b>${nopay.join(", ")}</b> — ` +
+        (nopay.length > 1 ? "they have" : "it has") +
+        " no minimum payment and there's no extra money to send");
+    }
+    if (interest.length) {
+      why.push(`interest on <b>${interest.join(", ")}</b> grows faster than the payments going in`);
+    }
+    html += `<div class="warnbox">This plan never gets you debt-free: ${why.join("; ")}.</div>`;
+  }
+  if (p.budget.monthly_income <= 0) {
+    html += `<p class="muted small">The extra-$ estimate is $0 because the app doesn't know your income yet.
+      Import bank statements (Spending tab), record a paycheck, or set monthly income in Settings.</p>`;
+  }
+  if (p.advice && p.advice.suggestions.length) {
+    const target = p.advice.target_debt ? esc(p.advice.target_debt) : "your target debt";
+    const b = p.advice.boosted;
+    const outcome = b.stuck || !b.months
+      ? "That's still not enough to reach zero — cut deeper or raise the payments on the stuck debts."
+      : `Do all of these and you free <b>${money(p.advice.monthly_freed)}/mo</b> —
+         debt-free in <b>${b.months} months</b> (${fmtDate(b.debt_free_date)})` +
+        (active.stuck ? " instead of never." : `, paying ${money(b.total_interest)} total interest.`);
+    html += `<div class="findmoney"><h3>Find the money in your spending</h3>` +
+      p.advice.suggestions.map((s) => `<div class="plan-item">
+        <span class="badge fun">cut</span>
+        <span>You spend <b>${money(s.monthly_avg)}/mo</b> on ${esc(s.category)} — stop
+          ${money(s.suggested_cut)} of it and send that to <b>${target}</b> instead</span>
+        <span class="amt">+${money(s.suggested_cut)}/mo</span></div>`).join("") +
+      `<p class="muted small">${outcome}</p></div>`;
+  } else if (active.stuck) {
+    html += `<p class="muted small">Import your bank statements on the Spending tab and the app will
+      show exactly which spending to cut to fix this.</p>`;
+  }
   if (active.timeline && active.timeline.length > 1) {
     html += chartSVG(active.timeline.map((t) => t.total_balance));
   }

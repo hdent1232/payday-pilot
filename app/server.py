@@ -123,7 +123,8 @@ class Handler(BaseHTTPRequestHandler):
                 debts = db.list_debts(conn)
                 bills = db.list_bills(conn)
                 paychecks = db.list_paychecks(conn, limit=12)
-                budget = engine.estimate_monthly_extra(bills, debts, settings, paychecks)
+                txns = db.list_transactions(conn, limit=10000)
+                budget = engine.estimate_monthly_extra(bills, debts, settings, paychecks, txns)
                 self._json({
                     "settings": settings, "debts": debts, "bills": bills,
                     "paychecks": paychecks, "budget": budget,
@@ -134,17 +135,40 @@ class Handler(BaseHTTPRequestHandler):
                 debts = db.list_debts(conn)
                 bills = db.list_bills(conn)
                 paychecks = db.list_paychecks(conn)
-                budget = engine.estimate_monthly_extra(bills, debts, settings, paychecks)
+                txns = db.list_transactions(conn, limit=10000)
+                budget = engine.estimate_monthly_extra(bills, debts, settings, paychecks, txns)
                 extra = budget["monthly_extra"]
                 if "extra" in query:
                     try:
                         extra = float(query["extra"][0])
                     except ValueError:
                         pass
+                # Where to find more money: cuttable spending from imported
+                # statements, and what sending it to debt would change.
+                advice = None
+                if txns and any(d["balance"] > 0.01 for d in debts):
+                    summary = importers.spending_summary(txns, 6)
+                    if summary["suggestions"]:
+                        strategy = settings["strategy"]
+                        target = engine.pick_target_debt(debts, strategy)
+                        cut = summary["potential_monthly_savings"]
+                        boosted = engine.simulate_payoff(debts, strategy, extra + cut)
+                        advice = {
+                            "suggestions": summary["suggestions"][:5],
+                            "monthly_freed": cut,
+                            "target_debt": target["name"] if target else None,
+                            "boosted": {
+                                "months": boosted["months"],
+                                "debt_free_date": boosted["debt_free_date"],
+                                "total_interest": boosted["total_interest"],
+                                "stuck": boosted["stuck"],
+                            },
+                        }
                 self._json({
                     "budget": budget,
                     "comparison": engine.compare_strategies(debts, extra),
                     "extra_used": extra,
+                    "advice": advice,
                 })
             elif route == "/api/transactions":
                 self._json({"transactions": db.list_transactions(conn)})
@@ -157,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
                 debts = db.list_debts(conn)
                 bills = db.list_bills(conn)
                 paychecks = db.list_paychecks(conn)
-                budget = engine.estimate_monthly_extra(bills, debts, settings, paychecks)
+                budget = engine.estimate_monthly_extra(bills, debts, settings, paychecks, txns)
                 cut = summary["potential_monthly_savings"]
                 if cut > 0 and any(d["balance"] > 0.01 for d in debts):
                     base = engine.simulate_payoff(debts, settings["strategy"], budget["monthly_extra"])

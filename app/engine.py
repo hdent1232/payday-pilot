@@ -290,7 +290,14 @@ def simulate_payoff(debts, strategy, monthly_extra, start=None):
         "debt_free_date": _add_months(start, month).isoformat() if not balances else None,
         "payoff_order": payoff_order,
         "timeline": timeline,
-        "stuck": bool(balances),  # payments don't cover interest
+        "stuck": bool(balances),
+        # why the plan never finishes: debts nothing is paid toward vs debts
+        # whose interest outruns their payment
+        "stuck_debts": [
+            {"name": info[did]["name"],
+             "reason": "no_payment" if info[did]["min_payment"] <= 0.005 else "interest"}
+            for did in balances
+        ],
     }
 
 
@@ -302,13 +309,26 @@ def _add_months(d, months):
     return date(year, month, day)
 
 
-def estimate_monthly_extra(bills, debts, settings, recent_paychecks):
-    """Best estimate of how much can go to extra debt payments each month."""
+def estimate_monthly_extra(bills, debts, settings, recent_paychecks, transactions=None):
+    """Best estimate of how much can go to extra debt payments each month.
+
+    Income source, in order: the Settings value, recorded paychecks, then
+    Income-category deposits from imported bank statements.
+    """
     income = float(settings["monthly_net_income"])
     if income <= 0 and recent_paychecks:
         checks = recent_paychecks[:8]
         avg = sum(p["amount"] for p in checks) / len(checks)
         income = avg * CHECKS_PER_MONTH[settings["pay_frequency"]]
+    if income <= 0 and transactions:
+        by_month = {}
+        for t in transactions:
+            if t["amount"] > 0 and t["category"] == "Income":
+                m = t["date"][:7]
+                by_month[m] = by_month.get(m, 0) + t["amount"]
+        if by_month:
+            months = sorted(by_month)[-3:]
+            income = sum(by_month[m] for m in months) / len(months)
     bills_total = sum(b["amount"] for b in bills)
     mins_total = sum(min(d["min_payment"], d["balance"]) for d in debts if d["balance"] > 0.01)
     variable = float(settings["variable_budget"])

@@ -321,15 +321,36 @@
       payoff_order: payoffOrder,
       timeline,
       stuck,
+      // why the plan never finishes: debts nothing is paid toward vs debts
+      // whose interest outruns their payment
+      stuck_debts: Object.keys(balances).map((id) => ({
+        name: info[id].name,
+        reason: info[id].min_payment <= 0.005 ? "no_payment" : "interest",
+      })),
     };
   }
 
-  function estimateMonthlyExtra(bills, debts, settings, recentPaychecks) {
+  // Income source, in order: the Settings value, recorded paychecks, then
+  // Income-category deposits from imported bank statements.
+  function estimateMonthlyExtra(bills, debts, settings, recentPaychecks, transactions) {
     let income = Number(settings.monthly_net_income);
     if (income <= 0 && recentPaychecks.length) {
       const checks = recentPaychecks.slice(0, 8);
       const avg = checks.reduce((s, p) => s + p.amount, 0) / checks.length;
       income = avg * CHECKS_PER_MONTH[settings.pay_frequency];
+    }
+    if (income <= 0 && transactions && transactions.length) {
+      const byMonth = {};
+      for (const t of transactions) {
+        if (t.amount > 0 && t.category === "Income") {
+          const m = t.date.slice(0, 7);
+          byMonth[m] = (byMonth[m] || 0) + t.amount;
+        }
+      }
+      const months = Object.keys(byMonth).sort().slice(-3);
+      if (months.length) {
+        income = months.reduce((s, m) => s + byMonth[m], 0) / months.length;
+      }
     }
     const billsTotal = bills.reduce((s, b) => s + b.amount, 0);
     const minsTotal = debts.reduce((s, d) =>
@@ -1019,7 +1040,7 @@
     const paychecks = listPaychecks(db, 12);
     return {
       settings, debts, bills, paychecks,
-      budget: estimateMonthlyExtra(bills, debts, settings, paychecks),
+      budget: estimateMonthlyExtra(bills, debts, settings, paychecks, listTransactions(db, 10000)),
       today: todayISO(),
     };
   }
@@ -1041,21 +1062,45 @@
 
       case "/api/projection": {
         const debts = listDebts(db);
-        const budget = estimateMonthlyExtra(listBills(db), debts, settings, listPaychecks(db));
+        const txns = listTransactions(db, 10000);
+        const budget = estimateMonthlyExtra(listBills(db), debts, settings, listPaychecks(db), txns);
         let extra = budget.monthly_extra;
         if (query.extra !== undefined && query.extra !== "" && !isNaN(Number(query.extra))) {
           extra = Number(query.extra);
         }
-        return { budget, comparison: compareStrategies(debts, extra), extra_used: extra };
+        // Where to find more money: cuttable spending from imported
+        // statements, and what sending it to debt would change.
+        let advice = null;
+        if (txns.length && debts.some((d) => d.balance > 0.01)) {
+          const summary = spendingSummary(txns, 6);
+          if (summary.suggestions.length) {
+            const target = pickTargetDebt(debts, settings.strategy);
+            const cut = summary.potential_monthly_savings;
+            const boosted = simulatePayoff(debts, settings.strategy, extra + cut);
+            advice = {
+              suggestions: summary.suggestions.slice(0, 5),
+              monthly_freed: cut,
+              target_debt: target ? target.name : null,
+              boosted: {
+                months: boosted.months,
+                debt_free_date: boosted.debt_free_date,
+                total_interest: boosted.total_interest,
+                stuck: boosted.stuck,
+              },
+            };
+          }
+        }
+        return { budget, comparison: compareStrategies(debts, extra), extra_used: extra, advice };
       }
 
       case "/api/transactions":
         return { transactions: listTransactions(db) };
 
       case "/api/spending": {
-        const summary = spendingSummary(listTransactions(db, 10000), Number(query.months) || 6);
+        const txns = listTransactions(db, 10000);
+        const summary = spendingSummary(txns, Number(query.months) || 6);
         const debts = listDebts(db);
-        const budget = estimateMonthlyExtra(listBills(db), debts, settings, listPaychecks(db));
+        const budget = estimateMonthlyExtra(listBills(db), debts, settings, listPaychecks(db), txns);
         const cut = summary.potential_monthly_savings;
         if (cut > 0 && debts.some((d) => d.balance > 0.01)) {
           const base = simulatePayoff(debts, settings.strategy, budget.monthly_extra);
