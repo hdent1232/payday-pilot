@@ -267,7 +267,7 @@ function renderDebts() {
   }
   tbody.innerHTML = STATE.debts.map((d) => `<tr>
       <td>${esc(d.name)}</td><td>${KIND_LABELS[d.kind] || esc(d.kind)}</td>
-      <td class="num">${money(d.balance)}</td><td class="num">${d.apr.toFixed(2)}%</td>
+      <td class="num">${money(d.balance)}</td><td class="num" ${d.apr_estimated ? 'title="estimated — edit to your real rate"' : ""}>${d.apr_estimated ? "~" : ""}${d.apr.toFixed(2)}%</td>
       <td class="num">${money(d.min_payment)}</td><td class="num">${d.term_months ?? "—"}</td>
       <td class="num">${d.due_day}</td>
       <td><button class="mini ghost" data-edit="${d.id}">edit</button>
@@ -348,7 +348,8 @@ $("#debt-import-parse").addEventListener("click", async () => {
   el.innerHTML = `<p class="muted small">Found ${debts.length} account(s) (${sourceLabel})${
       updates ? ` — <b>${updates}</b> match debts you already track and will be updated, not duplicated` : ""}.
       Review, fix anything that's off, then confirm.
-      APRs marked <i>est.</i> are typical rates for that debt type (credit reports don't list rates) — edit to your real rate:</p>
+      APRs marked <i>calc.</i> are calculated from the loan's own amount, payment and term in the document;
+      <i>est.</i> are typical rates for the debt type (credit reports don't list rates). Edit either to your real rate:</p>
     <table class="table"><thead><tr><th></th><th>Name</th><th class="num">Balance</th>
       <th class="num">APR %</th><th class="num">Min payment</th><th>Action</th></tr></thead><tbody>` +
     debts.map((d, i) => `<tr>
@@ -356,7 +357,7 @@ $("#debt-import-parse").addEventListener("click", async () => {
       <td><input value="${esc(d.name)}" data-f="name" data-i="${i}"></td>
       <td class="num"><input type="number" step="0.01" value="${d.balance}" data-f="balance" data-i="${i}" style="width:110px"></td>
       <td class="num"><input type="number" step="0.01" value="${d.apr}" data-f="apr" data-i="${i}" style="width:80px">${
-        d.apr_estimated ? "<span class='muted small'> est.</span>" : ""}</td>
+        d.apr_derived ? "<span class='muted small'> calc.</span>" : d.apr_estimated ? "<span class='muted small'> est.</span>" : ""}</td>
       <td class="num"><input type="number" step="0.01" value="${d.min_payment}" data-f="min_payment" data-i="${i}" style="width:100px"></td>
       <td class="small">${d.match_id ? `updates <b>${esc(d.match_name)}</b>` : "new"}</td>
     </tr>`).join("") +
@@ -364,9 +365,16 @@ $("#debt-import-parse").addEventListener("click", async () => {
       updates ? "Add & update selected debts" : "Add selected debts"}</button>`;
   el._debts = debts;
   $("#debt-import-confirm").addEventListener("click", async () => {
-    const rows = el._debts.map((d, i) => ({ ...d }));
+    const rows = el._debts.map((d) => ({ ...d }));
     el.querySelectorAll("input[data-f]").forEach((inp) => {
       rows[Number(inp.dataset.i)][inp.dataset.f] = inp.type === "number" ? Number(inp.value) : inp.value;
+    });
+    // an APR the user typed over in the review is real, not an estimate
+    rows.forEach((row, i) => {
+      if (Number(row.apr) !== Number(el._debts[i].apr)) {
+        row.apr_estimated = false;
+        row.apr_derived = false;
+      }
     });
     const selected = [];
     el.querySelectorAll("input[type=checkbox]").forEach((cb) => {
@@ -378,13 +386,15 @@ $("#debt-import-parse").addEventListener("click", async () => {
       const ex = row.match_id && STATE.debts.find((d) => d.id === row.match_id);
       if (!ex) { added++; return row; }
       updated++;
-      // reconcile: new document wins for balance/payment/term, but never
-      // overwrite a real APR or the user's name/due day with guesses
+      // reconcile: new document wins for balance/payment/term, but a rate the
+      // user set themselves is never overwritten by a guess or a calculation
+      const userSetApr = ex.apr > 0 && !ex.apr_estimated;
       return {
         ...row,
         id: ex.id,
         name: ex.name,
-        apr: ex.apr > 0 && (row.apr_estimated || !row.apr) ? ex.apr : row.apr,
+        apr: userSetApr ? ex.apr : (row.apr || ex.apr),
+        apr_estimated: userSetApr ? false : (row.apr ? !!row.apr_estimated : !!ex.apr_estimated),
         min_payment: row.min_payment || ex.min_payment,
         kind: row.kind !== "other" ? row.kind : ex.kind,
         term_months: row.term_months || ex.term_months,

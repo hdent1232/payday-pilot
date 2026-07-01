@@ -36,9 +36,11 @@ Everything runs 100% locally — your financial data never leaves your computer.
 - Import as many documents as you like: accounts are **consolidated, not
   duplicated** — the app matches debts across documents (masked account
   numbers, names, balances) and updates the ones you already track.
-- Credit reports never list interest rates, so a typical APR for each debt
-  type is filled in and marked as an estimate — your real rate always wins
-  once you set it.
+- Credit reports never list interest rates, but when a report carries the
+  loan's original amount, payment and term, the **contract APR is calculated
+  from the amortization math** (marked *calc.*). Otherwise a typical rate for
+  the debt type is used (marked *est.*). A rate you set yourself always wins
+  and is never overwritten by an import.
 - Avalanche (highest APR first — saves the most interest) vs snowball
   (smallest balance first — fastest wins) vs minimums-only comparison, with
   debt-free dates, total interest, payoff order and a balance chart.

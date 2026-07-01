@@ -551,22 +551,56 @@ def _parse_bureau_report(text):
         acct = re.search(r"Account Number\s+([^\n]+)", block)
         kind = next((k for key, k in _TB_KINDS if key in loan_type.lower()), "other")
         is_collection = "collection" in loan_type.lower() or bool(m.group(2))
-        debts.append({
+        entry = {
             "name": name[:60] + (" (collection)" if is_collection and "collection" not in name.lower() else ""),
             "balance": balance, "apr": 0,
             "min_payment": _tb_money_max("Monthly Payment Amount", block) or 0,
             "term_months": int(term.group(1)) if term and int(term.group(1)) > 1 else None,
             "due_day": 1, "kind": kind,
             "account_last4": _account_last4(acct.group(1) if acct else ""),
-        })
+        }
+        # High Credit on an installment loan is the original amount, and with
+        # the payment and term the contract rate falls out of the math.
+        if not is_collection and entry["term_months"]:
+            apr = derive_apr(_tb_money_max("High Credit", block), entry["min_payment"],
+                             entry["term_months"])
+            if apr:
+                entry["apr"] = apr
+                entry["apr_estimated"] = True
+                entry["apr_derived"] = True
+        debts.append(entry)
     return debts
 
 
 # Typical APRs by debt type, used only when the document carries no rate
-# (credit reports never do). Flagged apr_estimated so the review step and
-# any later merge know the number is a guess, not data.
+# (credit reports never do) AND the rate can't be derived from the loan's
+# own numbers. Flagged apr_estimated so the review step and any later merge
+# know the number is a guess, not data.
 APR_ESTIMATES = {"credit_card": 24.0, "auto_loan": 10.0, "student_loan": 6.5,
                  "personal": 12.0, "mortgage": 7.0}
+
+
+def derive_apr(principal, payment, months):
+    """Contract APR implied by an amortized loan (solve payment equation for rate).
+
+    Credit reports don't list rates, but original amount + monthly payment +
+    term pin the rate down exactly. Bisection on the monthly rate; None when
+    the inputs can't support a solve.
+    """
+    if not principal or not payment or not months or months < 2:
+        return None
+    if payment * months <= principal * 1.005:
+        return 0.0  # payments barely exceed principal: effectively 0%
+    lo, hi = 0.0, 0.06  # monthly; caps the answer at 72% APR
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        pv = payment * (1 - (1 + mid) ** -months) / mid
+        if pv > principal:
+            lo = mid
+        else:
+            hi = mid
+    apr = round((lo + hi) / 2 * 12 * 100, 2)
+    return apr if 0 < apr < 70 else None
 
 
 def _norm_debt_name(name):
@@ -627,6 +661,10 @@ def _consolidate(debts):
             dup["term_months"] = d["term_months"]
         if not dup.get("account_last4") and d.get("account_last4"):
             dup["account_last4"] = d["account_last4"]
+        if d.get("apr") and (not dup.get("apr") or (d.get("apr_derived") and not dup.get("apr_derived"))):
+            dup["apr"] = d["apr"]
+            dup["apr_estimated"] = bool(d.get("apr_estimated"))
+            dup["apr_derived"] = bool(d.get("apr_derived"))
         dup["balance"] = max(dup["balance"], d["balance"])
         if len(_norm_debt_name(d["name"])) > len(_norm_debt_name(dup["name"])) and "collection" not in d["name"].lower():
             dup["name"] = d["name"]

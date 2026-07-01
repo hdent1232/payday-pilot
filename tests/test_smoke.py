@@ -116,6 +116,7 @@ Account Details
  Reported Balance                      $8,000                  $8,100                         $8,000
  Loan Type                             automobile              automobile                     automobile
  Term Duration                         48                      48                             48
+ High Credit                           $10,000                 $10,000                        $10,000
  Monthly Payment Amount                $310                    $310                           $310
 
 4.2 Example Collections Co (CLOSED)
@@ -388,8 +389,24 @@ class CreditReportParseTest(unittest.TestCase):
         auto = by_name["Example Auto Finance"]
         self.assertEqual((auto["balance"], auto["min_payment"], auto["term_months"], auto["kind"]),
                          (8100.0, 310.0, 48, "auto_loan"))  # max across bureaus
+        # rate derived from $10,000 original / $310 x 48 payments, not guessed
+        self.assertTrue(auto["apr_derived"])
+        self.assertTrue(20 < auto["apr"] < 23, auto["apr"])
         col = by_name["Example Collections Co"]
         self.assertEqual((col["balance"], col["apr"]), (900.0, 0))  # merged, no APR guess
+
+    def test_derive_apr(self):
+        from app.importers import derive_apr
+        # $10,000 at 10% APR over 60 months amortizes to $212.47/mo
+        self.assertAlmostEqual(derive_apr(10000, 212.47, 60), 10.0, delta=0.05)
+        # real-world subprime auto: $12,212 original, $441 x 42
+        self.assertAlmostEqual(derive_apr(12212, 441, 42), 25.28, delta=0.05)
+        # payments that only cover principal mean ~0%
+        self.assertEqual(derive_apr(1000, 100, 10), 0.0)
+        # nonsense inputs solve to nothing
+        self.assertIsNone(derive_apr(0, 100, 12))
+        self.assertIsNone(derive_apr(1000, 0, 12))
+        self.assertIsNone(derive_apr(1000, 5000, 1))
 
     def test_debts_match(self):
         from app.importers import debts_match

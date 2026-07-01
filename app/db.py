@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS debts(
     term_months INTEGER,
     due_day     INTEGER NOT NULL DEFAULT 1,
     notes       TEXT NOT NULL DEFAULT '',
-    account_last4 TEXT NOT NULL DEFAULT ''
+    account_last4 TEXT NOT NULL DEFAULT '',
+    apr_estimated INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS bills(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +87,17 @@ def connect():
         conn.commit()
     except sqlite3.OperationalError:
         pass
+    try:  # migration: mark previously imported type-default APRs as estimates
+        conn.execute("ALTER TABLE debts ADD COLUMN apr_estimated INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "UPDATE debts SET apr_estimated=1 WHERE "
+            "(kind='credit_card' AND apr=24.0) OR (kind='auto_loan' AND apr=10.0) OR "
+            "(kind='student_loan' AND apr=6.5) OR (kind='personal' AND apr=12.0) OR "
+            "(kind='mortgage' AND apr=7.0)"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
@@ -130,17 +142,18 @@ def upsert_debt(conn, d):
         "due_day": max(1, min(28, int(d.get("due_day") or 1))),
         "notes": d.get("notes") or "",
         "account_last4": d.get("account_last4") or "",
+        "apr_estimated": 1 if d.get("apr_estimated") else 0,
     }
     if d.get("id"):
         conn.execute(
             "UPDATE debts SET name=?, kind=?, balance=?, apr=?, min_payment=?, "
-            "term_months=?, due_day=?, notes=?, account_last4=? WHERE id=?",
+            "term_months=?, due_day=?, notes=?, account_last4=?, apr_estimated=? WHERE id=?",
             (*fields.values(), d["id"]),
         )
     else:
         conn.execute(
             "INSERT INTO debts(name, kind, balance, apr, min_payment, term_months, due_day, "
-            "notes, account_last4) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "notes, account_last4, apr_estimated) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             tuple(fields.values()),
         )
     conn.commit()

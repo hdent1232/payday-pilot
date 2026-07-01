@@ -28,7 +28,16 @@
   function load() {
     try {
       const raw = localStorage.getItem(STORE_KEY);
-      if (raw) return JSON.parse(raw);
+      if (raw) {
+        const db = JSON.parse(raw);
+        // migration: mark previously imported type-default APRs as estimates
+        for (const d of db.debts || []) {
+          if (d.apr_estimated === undefined) {
+            d.apr_estimated = APR_ESTIMATES[d.kind] === d.apr ? 1 : 0;
+          }
+        }
+        return db;
+      }
     } catch (e) { /* corrupted store: start fresh */ }
     return { settings: {}, debts: [], bills: [], paychecks: [], transactions: [], rules: [], seq: 1 };
   }
@@ -868,23 +877,51 @@
       const acct = block.match(/Account Number\s+([^\n]+)/);
       const kindHit = TB_KINDS.find(([key]) => loanType.toLowerCase().includes(key));
       const isCollection = loanType.toLowerCase().includes("collection") || Boolean(m[2]);
-      debts.push({
+      const entry = {
         name: name.slice(0, 60) + (isCollection && !name.toLowerCase().includes("collection") ? " (collection)" : ""),
         balance, apr: 0,
         min_payment: tbMoneyMax("Monthly Payment Amount", block) || 0,
         term_months: term && Number(term[1]) > 1 ? Number(term[1]) : null,
         due_day: 1, kind: kindHit ? kindHit[1] : "other",
         account_last4: accountLast4(acct ? acct[1] : ""),
-      });
+      };
+      // High Credit on an installment loan is the original amount, and with
+      // the payment and term the contract rate falls out of the math.
+      if (!isCollection && entry.term_months) {
+        const apr = deriveApr(tbMoneyMax("High Credit", block), entry.min_payment, entry.term_months);
+        if (apr) {
+          entry.apr = apr;
+          entry.apr_estimated = true;
+          entry.apr_derived = true;
+        }
+      }
+      debts.push(entry);
     });
     return debts;
   }
 
   // Typical APRs by debt type, used only when the document carries no rate
-  // (credit reports never do). Flagged apr_estimated so the review step and
-  // any later merge know the number is a guess, not data.
+  // (credit reports never do) AND the rate can't be derived from the loan's
+  // own numbers. Flagged apr_estimated so the review step and any later merge
+  // know the number is a guess, not data.
   const APR_ESTIMATES = { credit_card: 24.0, auto_loan: 10.0, student_loan: 6.5,
     personal: 12.0, mortgage: 7.0 };
+
+  // Contract APR implied by an amortized loan (solve payment equation for
+  // rate). Credit reports don't list rates, but original amount + monthly
+  // payment + term pin the rate down exactly. Bisection on the monthly rate.
+  function deriveApr(principal, payment, months) {
+    if (!principal || !payment || !months || months < 2) return null;
+    if (payment * months <= principal * 1.005) return 0;
+    let lo = 0, hi = 0.06; // monthly; caps the answer at 72% APR
+    for (let i = 0; i < 80; i++) {
+      const mid = (lo + hi) / 2;
+      const pv = payment * (1 - Math.pow(1 + mid, -months)) / mid;
+      if (pv > principal) lo = mid; else hi = mid;
+    }
+    const apr = Math.round((lo + hi) / 2 * 12 * 100 * 100) / 100;
+    return apr > 0 && apr < 70 ? apr : null;
+  }
 
   function normDebtName(name) {
     return (name || "").toLowerCase().replace("(collection)", "").replace(/[^a-z0-9]/g, "");
@@ -930,6 +967,11 @@
       if (dup.kind === "other" && d.kind !== "other") dup.kind = d.kind;
       if (!dup.term_months && d.term_months) dup.term_months = d.term_months;
       if (!dup.account_last4 && d.account_last4) dup.account_last4 = d.account_last4;
+      if (d.apr && (!dup.apr || (d.apr_derived && !dup.apr_derived))) {
+        dup.apr = d.apr;
+        dup.apr_estimated = Boolean(d.apr_estimated);
+        dup.apr_derived = Boolean(d.apr_derived);
+      }
       dup.balance = Math.max(dup.balance, d.balance);
       if (normDebtName(d.name).length > normDebtName(dup.name).length && !d.name.toLowerCase().includes("collection")) {
         dup.name = d.name;
@@ -1077,6 +1119,7 @@
       due_day: Math.max(1, Math.min(28, Math.trunc(Number(d.due_day)) || 1)),
       notes: d.notes || "",
       account_last4: d.account_last4 || "",
+      apr_estimated: d.apr_estimated ? 1 : 0,
     };
     if (d.id) {
       const existing = db.debts.find((x) => x.id === Number(d.id));
