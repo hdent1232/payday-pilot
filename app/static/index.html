@@ -102,13 +102,15 @@
 
   <div class="panel">
     <h2>Import from credit report</h2>
-    <p class="muted small">Paste text copied from your credit report (Credit Karma, Experian, etc.) or a CSV with
-      columns <code>name, balance, apr, min payment, term, due day</code>. Found accounts appear below for review —
-      nothing is saved until you confirm. You can also
-      <a href="#" id="debt-csv-template">download a CSV template</a>.</p>
+    <p class="muted small">Upload your credit report <b>PDF</b> (Experian, SafeRent and other tenant-screening
+      reports work — the file is read on your device), paste text copied from your credit report
+      (Credit Karma, Experian, etc.), or use a CSV with columns
+      <code>name, balance, apr, min payment, term, due day</code>. Found accounts appear below for review —
+      nothing is saved until you confirm. Credit reports don't list APRs, so check those before confirming.
+      You can also <a href="#" id="debt-csv-template">download a CSV template</a>.</p>
     <textarea id="debt-import-text" rows="6" placeholder="Paste credit report text or CSV here…"></textarea>
     <div class="row-form">
-      <input type="file" id="debt-import-file" accept=".csv,.txt">
+      <input type="file" id="debt-import-file" accept=".csv,.txt,.pdf">
       <button class="primary" id="debt-import-parse">Find debts</button>
     </div>
     <div id="debt-import-review"></div>

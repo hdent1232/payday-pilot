@@ -310,7 +310,19 @@ function resetDebtForm() {
 
 $("#debt-import-file").addEventListener("change", async (e) => {
   const f = e.target.files[0];
-  if (f) $("#debt-import-text").value = await f.text();
+  if (!f) return;
+  if (/\.pdf$/i.test(f.name) || f.type === "application/pdf") {
+    toast(`Reading ${f.name}…`);
+    try {
+      $("#debt-import-text").value = await extractPdfText(f);
+    } catch (err) {
+      toast(`${f.name}: ${err.message}`);
+      return;
+    }
+    $("#debt-import-parse").click();
+  } else {
+    $("#debt-import-text").value = await f.text();
+  }
 });
 
 $("#debt-csv-template").addEventListener("click", (e) => {
@@ -329,7 +341,8 @@ $("#debt-import-parse").addEventListener("click", async () => {
       "columns: name, balance, apr, min payment, term, due day.</div>";
     return;
   }
-  el.innerHTML = `<p class="muted small">Found ${debts.length} account(s) (${source === "csv" ? "CSV" : "text scan"}).
+  const sourceLabel = { csv: "CSV", report: "credit report" }[source] || "text scan";
+  el.innerHTML = `<p class="muted small">Found ${debts.length} account(s) (${sourceLabel}).
       Review, fix anything that's off, then confirm:</p>
     <table class="table"><thead><tr><th></th><th>Name</th><th class="num">Balance</th>
       <th class="num">APR %</th><th class="num">Min payment</th></tr></thead><tbody>` +

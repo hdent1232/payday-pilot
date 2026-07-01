@@ -205,6 +205,9 @@ class Handler(BaseHTTPRequestHandler):
                 debts = importers.parse_debts_csv(text)
                 source = "csv"
                 if not debts:
+                    debts = importers.parse_credit_report_text(text)
+                    source = "report"
+                if not debts:
                     debts = importers.parse_debts_text(text)
                     source = "text"
                 self._json({"debts": debts, "source": source})

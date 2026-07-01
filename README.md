@@ -28,9 +28,11 @@ Everything runs 100% locally — your financial data never leaves your computer.
 
 **Debts & payoff planning**
 - Track every debt: balance, APR, minimum payment, term, due day.
-- Import debts from a CSV or paste text straight from your credit report
-  (Credit Karma / Experian / etc.) — found accounts are shown for review
-  before anything is saved.
+- Import debts straight from your credit report: upload the **PDF report
+  itself** (Experian, SafeRent and other tenant-screening reports — open
+  accounts and collections are extracted on your device), paste copied text
+  (Credit Karma / Experian / etc.), or use a CSV — found accounts are shown
+  for review before anything is saved.
 - Avalanche (highest APR first — saves the most interest) vs snowball
   (smallest balance first — fastest wins) vs minimums-only comparison, with
   debt-free dates, total interest, payoff order and a balance chart.

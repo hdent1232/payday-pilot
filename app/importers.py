@@ -412,6 +412,109 @@ def parse_debts_text(text):
     return found
 
 
+# Bureau/tenant-screening reports (Experian, SafeRent, RentGrow, …) lay out
+# each account as a "CREDITOR - Member # 123" header followed by labeled
+# fields. pdf.js flattens the two-column layout into single lines, so fields
+# are found by label anywhere in the account's block, not by position.
+_CR_LABELS = (
+    "Reported", "Type", "Industry", "Account\\s*#", "High Credit", "Credit Limit",
+    "Payment", "Past Due", "Balance", "Months Reviewed", "Last Activity",
+    "Original Loan Amount", "ECOA", "Narrative", "Opened", "Status",
+    "Date Reported", "Agency Customer\\s*#", "Balance Due", "Past Due Amount",
+    "Balance Date", "Account/Serial\\s*#", "Collection Agency",
+    "Original Amount Owed",
+)
+_CR_LABEL_RE = "(?:" + "|".join(_CR_LABELS) + ")\\s*:"
+_CR_TRADELINE_HEAD = re.compile(r"^[ \t\f]*(\S[^\n]{1,60}?)\s*[-–]\s*Member\s*#", re.M)
+_CR_SECTION_END = re.compile(r"\b(?:Inquiries|Collections|Credit Report Serviced)\b")
+
+_CR_STUDENT = ("college", "studen", "sallie", "navient", "nelnet", "mohela",
+               "edfinancial", "aidvantage", "fedloan", "great lakes", "earnest", "uas")
+_CR_AUTO = ("auto", "westlake", "toyota", "honda", "gm financial", "ford credit",
+            "carmax", "car loan", "vehicle")
+
+
+def _cr_money(label, chunk):
+    m = re.search(r"(?<![A-Za-z])" + label + r"\s*:\s*\$?\s*" + MONEY_RE, chunk, re.I)
+    return float(m.group(1).replace(",", "")) if m else None
+
+
+def _cr_field(label, chunk):
+    m = re.search(r"(?<![A-Za-z])" + label + r"\s*:\s*(.*?)(?=\s*" + _CR_LABEL_RE + r"|\n|$)",
+                  chunk, re.I)
+    return m.group(1).strip() if m else ""
+
+
+def _cr_kind(name, type_, industry):
+    s = f"{name} {industry}".lower()
+    if any(k in s for k in _CR_STUDENT):
+        return "student_loan"
+    if any(k in s for k in _CR_AUTO):
+        return "auto_loan"
+    if type_.lower().startswith("revolv") or "credit card" in industry.lower():
+        return "credit_card"
+    if "medical" in s:
+        return "medical"
+    if "mortgage" in f"{type_} {industry}".lower():
+        return "mortgage"
+    return "other"
+
+
+def parse_credit_report_text(text):
+    """Extract open accounts + collections from a full credit report (PDF text).
+
+    Handles the tradeline layout used by Experian-fed screening reports
+    (SafeRent etc.): credit reports carry no APR or due day, so those default
+    to 0/1 and the review step lets the user fill them in. Zero-balance
+    accounts are skipped — there's nothing to pay off.
+    """
+    debts = []
+    heads = list(_CR_TRADELINE_HEAD.finditer(text))
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else min(len(text), m.end() + 2500)
+        block = text[m.end():end]
+        term = _CR_SECTION_END.search(block)
+        if term:
+            block = block[:term.start()]
+        balance = _cr_money("Balance", block)
+        if not balance:
+            continue
+        name = re.sub(r"\s+", " ", m.group(1)).strip(" -")
+        type_ = _cr_field("Type", block)
+        industry = _cr_field("Industry", block)
+        debts.append({
+            "name": name[:60], "balance": balance, "apr": 0,
+            "min_payment": _cr_money("Payment", block) or 0,
+            "term_months": None, "due_day": 1,
+            "kind": _cr_kind(name, type_, industry),
+        })
+    # Collections: anchored on "Balance Due" with a collection marker nearby.
+    # The creditor's name renders as the leading text of the rows between the
+    # "Creditor:" label and the balance line (the left column of the layout).
+    for m in re.finditer(r"(?<![A-Za-z])Balance Due\s*:\s*\$?\s*" + MONEY_RE, text, re.I):
+        window = text[max(0, m.start() - 500):m.start()]
+        if not re.search(r"collection", window + text[m.end():m.end() + 200], re.I):
+            continue
+        balance = float(m.group(1).replace(",", ""))
+        if not balance:
+            continue
+        cred_matches = list(re.finditer(r"Creditor\s*:", window, re.I))
+        parts = []
+        if cred_matches:
+            for ln in window[cred_matches[-1].end():].splitlines():
+                lead = re.split(_CR_LABEL_RE, ln.strip(), maxsplit=1)[0].strip()
+                if lead:
+                    parts.append(lead)
+        name = " ".join(parts)[:50] or _cr_field("Collection Agency", window) or "Collection account"
+        entry = {
+            "name": f"{name} (collection)"[:60], "balance": balance, "apr": 0,
+            "min_payment": 0, "term_months": None, "due_day": 1, "kind": "other",
+        }
+        if all(abs(d["balance"] - balance) > 0.01 or d["name"] != entry["name"] for d in debts):
+            debts.append(entry)
+    return debts
+
+
 # ------------------------------------------------------------ spending analysis
 
 def spending_summary(transactions, months=6):

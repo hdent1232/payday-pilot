@@ -48,6 +48,48 @@ Minimum payment: $96
 Discover it Card   Balance $890.10   18.5% APR   min payment $35
 """
 
+# Mimics the tradeline layout of Experian-fed screening reports (SafeRent
+# etc.) after pdf.js flattens the two-column PDF into lines. Fake data.
+SCREENING_REPORT_TEXT = """SAFERENT SCORE REPORT powered by VantageScore 4.0
+Credit Details - Information provided by Experian
+Credit Summary
+Total Tradelines 4 Collections 1 Public Records 0
+
+Collections
+Creditor: Date Reported: 11/01/2025 Collection Agency: EXAMPLE RECOVERY CO
+CITY UTILITY DISTRICT Agency Customer #: 1234567 Original Amount Owed: $842
+Balance Due: $842 Balance Date: 05/01/2026
+Past Due Amount: $842 Account/Serial #: XXX9999
+
+Tradelines
+FIRST EXAMPLE LENDING - Member # 1111111 Status: Account 30 days past due date
+Reported: 04/01/2026 Type: Installment High Credit: N/A Credit Limit: N/A
+Opened: 08/24/2023 Industry: Service & Professional Payment: $210 Past Due: $420
+Last Activity: 04/30/2026 Account #: XXXX1234 Balance: $12,450 Months Reviewed: 30
+Original Loan Amount: $15,000 ECOA: Individual Narrative: N/A
+
+Payment Summary (30 Months) Dec Nov Oct Sep Aug Jul Jun May Apr Mar Feb Jan
+C = Current 2026 30 C C C
+
+EXAMPLE BANK CARD - Member # 2222222 Status: This is an account in good standing
+Reported: 05/01/2026 Type: Revolving High Credit: $900 Credit Limit: $800
+Opened: 08/26/2024 Industry: Bank Credit Card Payment: $25 Past Due: N/A
+Last Activity: 05/11/2026 Account #: N/A Balance: $310 Months Reviewed: 20
+
+PAIDOFF CARD CO - Member # 3333333 Status: This is an account in good standing
+Reported: 05/01/2026 Type: Revolving High Credit: $500 Credit Limit: $500
+Payment: $0 Past Due: N/A Balance: $0 Months Reviewed: 12
+
+CAMPUS STUDENT LNS - Member # 4444444 Status: Account delinquent 180 days past due date
+Reported: 05/01/2026 Type: Installment Payment: $66 Past Due: $462
+Account #: XXX0829 Balance: $6,280 Months Reviewed: 34
+Original Loan Amount: $5,500 ECOA: Individual
+
+Inquiries
+Date Account Name Account Number
+12/24/2024 EXAMPLE INQUIRY 1234567
+"""
+
 
 class SmokeTest(unittest.TestCase):
     @classmethod
@@ -104,6 +146,12 @@ class SmokeTest(unittest.TestCase):
         balances = sorted(d["balance"] for d in scanned["debts"])
         self.assertIn(3204.55, balances)
         self.assertIn(890.10, balances)
+
+        # -- debts via a full credit-report PDF's extracted text (review only,
+        #    nothing saved until confirmed)
+        report = self.call("/api/debts/import", {"text": SCREENING_REPORT_TEXT})
+        self.assertEqual(report["source"], "report")
+        self.assertEqual(len(report["debts"]), 4)
 
         state = self.call("/api/state")
         self.assertEqual(len(state["bills"]), 4)
@@ -247,6 +295,33 @@ class StatementParseTest(unittest.TestCase):
         self.assertEqual(by_desc["ONLINE PAYME"]["amount"], -90.12)
         self.assertEqual(by_desc["DIRECT DEP E"]["amount"], 1500.0)
         self.assertTrue(all(t["date"].startswith("2026-01") for t in txns))
+
+
+class CreditReportParseTest(unittest.TestCase):
+    def test_screening_report(self):
+        from app.importers import parse_credit_report_text
+        debts = parse_credit_report_text(SCREENING_REPORT_TEXT)
+        by_name = {d["name"]: d for d in debts}
+        self.assertEqual(len(debts), 4)
+        lending = by_name["FIRST EXAMPLE LENDING"]
+        self.assertEqual(lending["balance"], 12450.0)
+        self.assertEqual(lending["min_payment"], 210.0)
+        card = by_name["EXAMPLE BANK CARD"]
+        self.assertEqual(card["balance"], 310.0)
+        self.assertEqual(card["kind"], "credit_card")
+        student = by_name["CAMPUS STUDENT LNS"]
+        self.assertEqual(student["balance"], 6280.0)
+        self.assertEqual(student["kind"], "student_loan")
+        collection = by_name["CITY UTILITY DISTRICT (collection)"]
+        self.assertEqual(collection["balance"], 842.0)
+        # paid-off account skipped — nothing to pay down
+        self.assertNotIn("PAIDOFF CARD CO", by_name)
+
+    def test_ignores_plain_text_and_disclosures(self):
+        from app.importers import parse_credit_report_text
+        self.assertEqual(parse_credit_report_text(CREDIT_REPORT_TEXT), [])
+        self.assertEqual(parse_credit_report_text("A Summary of Your Rights Under the "
+                                                  "Fair Credit Reporting Act"), [])
 
 
 class EngineTest(unittest.TestCase):

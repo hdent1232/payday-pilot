@@ -723,6 +723,93 @@
     return found;
   }
 
+  // Bureau/tenant-screening reports (Experian, SafeRent, RentGrow, …) lay out
+  // each account as a "CREDITOR - Member # 123" header followed by labeled
+  // fields. pdf.js flattens the two-column layout into single lines, so fields
+  // are found by label anywhere in the account's block, not by position.
+  const CR_LABELS = "(?:Reported|Type|Industry|Account\\s*#|High Credit|Credit Limit|Payment|" +
+    "Past Due|Balance|Months Reviewed|Last Activity|Original Loan Amount|ECOA|Narrative|Opened|" +
+    "Status|Date Reported|Agency Customer\\s*#|Balance Due|Past Due Amount|Balance Date|" +
+    "Account/Serial\\s*#|Collection Agency|Original Amount Owed)\\s*:";
+  const CR_TRADELINE_HEAD = /^[ \t\f]*(\S[^\n]{1,60}?)\s*[-–]\s*Member\s*#/gm;
+  const CR_SECTION_END = /\b(?:Inquiries|Collections|Credit Report Serviced)\b/;
+  const CR_STUDENT = ["college", "studen", "sallie", "navient", "nelnet", "mohela",
+    "edfinancial", "aidvantage", "fedloan", "great lakes", "earnest", "uas"];
+  const CR_AUTO = ["auto", "westlake", "toyota", "honda", "gm financial", "ford credit",
+    "carmax", "car loan", "vehicle"];
+
+  function crMoney(label, chunk) {
+    const m = chunk.match(new RegExp("(?<![A-Za-z])" + label + "\\s*:\\s*\\$?\\s*" + MONEY_RE, "i"));
+    return m ? Number(m[1].replace(/,/g, "")) : null;
+  }
+
+  function crField(label, chunk) {
+    const m = chunk.match(new RegExp("(?<![A-Za-z])" + label + "\\s*:\\s*(.*?)(?=\\s*" + CR_LABELS + "|\\n|$)", "i"));
+    return m ? m[1].trim() : "";
+  }
+
+  function crKind(name, type, industry) {
+    const s = (name + " " + industry).toLowerCase();
+    if (CR_STUDENT.some((k) => s.includes(k))) return "student_loan";
+    if (CR_AUTO.some((k) => s.includes(k))) return "auto_loan";
+    if (/^revolv/i.test(type) || industry.toLowerCase().includes("credit card")) return "credit_card";
+    if (s.includes("medical")) return "medical";
+    if ((type + " " + industry).toLowerCase().includes("mortgage")) return "mortgage";
+    return "other";
+  }
+
+  // Mirrors importers.parse_credit_report_text — extracts open accounts and
+  // collections from full credit-report text. Credit reports carry no APR or
+  // due day, so those default to 0/1 for the review step. Zero-balance
+  // accounts are skipped — there's nothing to pay off.
+  function parseCreditReportText(text) {
+    const debts = [];
+    const heads = [...text.matchAll(CR_TRADELINE_HEAD)];
+    heads.forEach((m, i) => {
+      const start = m.index + m[0].length;
+      const end = i + 1 < heads.length ? heads[i + 1].index : Math.min(text.length, start + 2500);
+      let block = text.slice(start, end);
+      const term = block.match(CR_SECTION_END);
+      if (term) block = block.slice(0, term.index);
+      const balance = crMoney("Balance", block);
+      if (!balance) return;
+      const name = m[1].replace(/\s+/g, " ").replace(/^[- ]+|[- ]+$/g, "");
+      debts.push({
+        name: name.slice(0, 60), balance, apr: 0,
+        min_payment: crMoney("Payment", block) || 0,
+        term_months: null, due_day: 1,
+        kind: crKind(name, crField("Type", block), crField("Industry", block)),
+      });
+    });
+    // Collections: anchored on "Balance Due" with a collection marker nearby.
+    // The creditor's name renders as the leading text of the rows between the
+    // "Creditor:" label and the balance line (the left column of the layout).
+    for (const m of text.matchAll(new RegExp("(?<![A-Za-z])Balance Due\\s*:\\s*\\$?\\s*" + MONEY_RE, "gi"))) {
+      const win = text.slice(Math.max(0, m.index - 500), m.index);
+      if (!/collection/i.test(win + text.slice(m.index, m.index + 200))) continue;
+      const balance = Number(m[1].replace(/,/g, ""));
+      if (!balance) continue;
+      const creds = [...win.matchAll(/Creditor\s*:/gi)];
+      const parts = [];
+      if (creds.length) {
+        const last = creds[creds.length - 1];
+        for (const ln of win.slice(last.index + last[0].length).split(/\r?\n/)) {
+          const lead = ln.trim().split(new RegExp(CR_LABELS))[0].trim();
+          if (lead) parts.push(lead);
+        }
+      }
+      const name = parts.join(" ").slice(0, 50) || crField("Collection Agency", win) || "Collection account";
+      const entry = {
+        name: (name + " (collection)").slice(0, 60), balance, apr: 0,
+        min_payment: 0, term_months: null, due_day: 1, kind: "other",
+      };
+      if (debts.every((d) => Math.abs(d.balance - balance) > 0.01 || d.name !== entry.name)) {
+        debts.push(entry);
+      }
+    }
+    return debts;
+  }
+
   function normalizeMerchant(desc) {
     return desc.toLowerCase().replace(/[#*\d]/g, "").replace(/\s+/g, " ").trim().slice(0, 32);
   }
@@ -1017,6 +1104,7 @@
         const text = body.text || "";
         let debts = parseDebtsCsv(text);
         let source = "csv";
+        if (!debts.length) { debts = parseCreditReportText(text); source = "report"; }
         if (!debts.length) { debts = parseDebtsText(text); source = "text"; }
         return { debts, source };
       }
@@ -1089,6 +1177,6 @@
     },
     // exposed for tests
     _internals: { buildPlan, simulatePayoff, spendingSummary, parseBankCsv, parseDebtsCsv,
-      parseDebtsText, parseStatementText, nextDueDate, estimateMonthlyExtra },
+      parseDebtsText, parseCreditReportText, parseStatementText, nextDueDate, estimateMonthlyExtra },
   };
 })();
