@@ -510,6 +510,9 @@
     ["hinge", "Subscriptions"], ["tinder", "Subscriptions"], ["bumble", "Subscriptions"],
     ["chime", "Transfers"], ["varo", "Transfers"], ["apple cash", "Transfers"],
     ["discover e-pay", "Debt Payment"], ["discover payment", "Debt Payment"],
+    ["discover retry", "Debt Payment"], ["discover card", "Debt Payment"],
+    ["discover bank", "Debt Payment"], ["debit discover", "Debt Payment"],
+    ["retry pymt", "Debt Payment"],
     ["steam", "Entertainment"], ["playstation", "Entertainment"], ["xbox", "Entertainment"],
     ["cinema", "Entertainment"], ["theatre", "Entertainment"], ["ticketmaster", "Entertainment"],
     ["365 market", "Dining"], ["aramark", "Dining"], ["waffle house", "Dining"],
@@ -1263,9 +1266,14 @@
     cancel: "cancel it — a subscription you're paying every month",
     eliminate: "cut it entirely — pure convenience, the substitute is free or already budgeted",
     trim: "go half as often",
-    review: "recurring charge the app can't identify — if it's a bill (insurance, rent), " +
-      "press Keep so it's never counted as cuttable; if it's an unwanted subscription, cancel it",
+    review: "the app can't identify this — if it's a bill or a debt payment, add it on the " +
+      "Bills/Debts tab or press Keep; if it's an unwanted subscription, cancel it",
   };
+
+  // Bank descriptors that mean money is being PAID to a lender or biller —
+  // never spending to cut, even when the app can't tell which one.
+  const PAYMENT_MARKERS = ["pymt", "pmt", "payment", "epay", "e-pay", "autopay",
+    "webpay", "billpay", "bill pay"];
 
   function cutPriority(cut, necessity, perMonth) {
     const freq = 1 + Math.min(perMonth || 0, 12) / 24; // frequent habits are easier to shave
@@ -1343,7 +1351,9 @@
         // a steady monthly charge is only "cancel a subscription" advice when
         // it lives in a subscription-ish category — a same-priced monthly
         // Target run is a habit, not a membership
-        if (steady && g.category === "Subscriptions") {
+        if (kept.some((h) => PAYMENT_MARKERS.some((mk) => h[2].toLowerCase().includes(mk)))) {
+          action = "review"; // a payment to some lender/biller — never cuttable
+        } else if (steady && g.category === "Subscriptions") {
           action = "cancel";
         } else if (steady) {
           action = "review"; // could be insurance or rent — ask, don't advise

@@ -61,6 +61,9 @@ DEFAULT_RULES = [
     ("hinge", "Subscriptions"), ("tinder", "Subscriptions"), ("bumble", "Subscriptions"),
     ("chime", "Transfers"), ("varo", "Transfers"), ("apple cash", "Transfers"),
     ("discover e-pay", "Debt Payment"), ("discover payment", "Debt Payment"),
+    ("discover retry", "Debt Payment"), ("discover card", "Debt Payment"),
+    ("discover bank", "Debt Payment"), ("debit discover", "Debt Payment"),
+    ("retry pymt", "Debt Payment"),
     ("steam", "Entertainment"), ("playstation", "Entertainment"), ("xbox", "Entertainment"),
     ("cinema", "Entertainment"), ("theatre", "Entertainment"), ("ticketmaster", "Entertainment"),
     ("365 market", "Dining"), ("aramark", "Dining"), ("waffle house", "Dining"),
@@ -950,9 +953,14 @@ _CUT_WORDING = {
     "cancel": "cancel it — a subscription you're paying every month",
     "eliminate": "cut it entirely — pure convenience, the substitute is free or already budgeted",
     "trim": "go half as often",
-    "review": "recurring charge the app can't identify — if it's a bill (insurance, rent), "
-              "press Keep so it's never counted as cuttable; if it's an unwanted subscription, cancel it",
+    "review": "the app can't identify this — if it's a bill or a debt payment, add it on the "
+              "Bills/Debts tab or press Keep; if it's an unwanted subscription, cancel it",
 }
+
+# Bank descriptors that mean money is being PAID to a lender or biller —
+# never spending to cut, even when the app can't tell which one.
+_PAYMENT_MARKERS = ("pymt", "pmt", "payment", "epay", "e-pay", "autopay",
+                    "webpay", "billpay", "bill pay")
 
 
 def _cut_priority(cut, necessity, per_month):
@@ -1032,7 +1040,9 @@ def build_cut_plan(transactions, months=6, protected=None):
             # when it's actually categorized as one — an unrecognized steady
             # charge could be insurance or rent; never tell someone to cancel
             # a bill the law or their lease requires
-            if steady and g["category"] == "Subscriptions":
+            if any(mk in desc.lower() for _, _, desc, _ in hits for mk in _PAYMENT_MARKERS):
+                action = "review"  # a payment to some lender/biller — never cuttable
+            elif steady and g["category"] == "Subscriptions":
                 action = "cancel"
             elif steady:
                 action = "review"  # could be insurance or rent — ask, don't advise

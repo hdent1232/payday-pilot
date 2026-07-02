@@ -565,6 +565,31 @@ class CategorizationTest(unittest.TestCase):
         self.assertEqual(categorize("PP*GOOGLE HINGE 402-935-7733 CA", rules), "Subscriptions")
         self.assertEqual(categorize("ROOT INS COLUMBUS OH", rules), "Insurance")
 
+    def test_debt_payments_recognized_without_tracking_the_debt(self):
+        # the user's Discover card had a $0 balance so it was never imported
+        # as a debt — its payments must STILL never look like spending
+        from app.importers import categorize, merge_rules
+        rules = merge_rules([])  # no debts tracked at all
+        self.assertEqual(categorize("DEBIT DISCOVER RETRY PYMT", rules), "Debt Payment")
+        self.assertEqual(categorize("DEBIT XYZLENDER RETRY PYMT", rules), "Debt Payment")
+
+    def test_payment_like_charges_never_become_cuts(self):
+        # even a totally unknown lender: "PYMT"-style descriptors are money
+        # going to a biller — at most a "review" item worth $0 in savings
+        from app.importers import build_cut_plan
+        txns = [
+            {"date": "2026-01-09", "description": "WEB PMT ACME FUNDING", "amount": -1331.51,
+             "category": "Other"},
+            {"date": "2026-04-09", "description": "WEB PMT ACME FUNDING", "amount": -26.18,
+             "category": "Other"},
+        ]
+        plan = build_cut_plan(txns, 6)
+        acme = next((i for i in plan if "ACME" in i["label"]), None)
+        if acme is not None:
+            self.assertEqual(acme["action"], "review")
+            self.assertEqual(acme["suggested_cut"], 0)
+        self.assertFalse(any(i["suggested_cut"] > 0 and "ACME" in i["label"] for i in plan))
+
     def test_debt_payments_recognized_from_tracked_debts(self):
         from app.importers import categorize, merge_rules
         debts = [{"name": "DISCOVERC"}, {"name": "UAS/COLLEGE AVE STUDEN"}]
