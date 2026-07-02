@@ -91,7 +91,8 @@ AMOUNT_COLS = ("amount", "transaction amount", "amt")
 DEBIT_COLS = ("debit", "withdrawal", "withdrawals", "money out", "outflow")
 CREDIT_COLS = ("credit", "deposit", "deposits", "money in", "inflow")
 
-DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%d/%m/%Y", "%b %d, %Y", "%d %b %Y")
+DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%d/%m/%Y", "%b %d, %Y",
+                "%d %b %Y", "%B %d, %Y")
 
 
 def _parse_date(value):
@@ -686,6 +687,60 @@ def parse_credit_report_text(text):
             d["apr"] = APR_ESTIMATES[d["kind"]]
             d["apr_estimated"] = True
     return debts
+
+
+# ------------------------------------------------------------ pay stubs
+
+# Net-pay labels in priority order: the first label that yields a dollar
+# amount wins, and the first amount after the label is the current period
+# (the second is usually the YTD column).
+_STUB_NET_LABELS = ("net pay", "net check", "net amount", "take home", "total net",
+                    "net earnings", "net deposit", "amount deposited", "deposit amount",
+                    "check amount", "direct deposit")
+_STUB_GROSS_LABELS = ("gross pay", "total gross", "gross earnings", "total earnings")
+_STUB_DATE_LABELS = ("pay date", "check date", "date paid", "deposit date",
+                     "payment date", "advice date", "period end")
+_STUB_DATE_RE = r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Za-z]{3,9}\.? \d{1,2},? \d{4})"
+
+
+def _stub_amount(labels, text):
+    for label in labels:
+        for m in re.finditer(label + r"\W{0,20}?" + MONEY_RE, text, re.I):
+            value = float(m.group(1).replace(",", ""))
+            if value > 0:
+                return value
+    return None
+
+
+def parse_paystub_text(text):
+    """Pull net pay, pay date and employer out of a pay stub's text.
+
+    Returns None when nothing that looks like a paycheck amount is found.
+    "net" is False when only a gross figure was found — the UI warns so taxes
+    aren't planned as spendable money.
+    """
+    net = _stub_amount(_STUB_NET_LABELS, text)
+    gross = _stub_amount(_STUB_GROSS_LABELS, text)
+    amount = net or gross
+    if not amount:
+        return None
+    date = ""
+    for label in _STUB_DATE_LABELS:
+        m = re.search(label + r"\W{0,20}?" + _STUB_DATE_RE, text, re.I)
+        if m:
+            parsed = _parse_date(m.group(1).replace(".", ""))
+            if parsed:
+                date = parsed
+                break
+    source = ""
+    for line in text.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if len(re.sub(r"[^A-Za-z]", "", line)) >= 3 and not re.search(
+                r"earnings statement|pay ?stub|payroll advice|statement of", line, re.I):
+            source = line[:32]
+            break
+    return {"amount": round(amount, 2), "net": net is not None, "date": date,
+            "source": source or "Paycheck"}
 
 
 # ------------------------------------------------------------ spending analysis

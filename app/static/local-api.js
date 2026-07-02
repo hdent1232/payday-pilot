@@ -23,6 +23,8 @@
     fun_pct: "5",
     variable_budget: "600",
     monthly_net_income: "0",
+    bank_balance: "",
+    bank_balance_updated: "",
   };
 
   function load() {
@@ -1000,6 +1002,72 @@
     return desc.toLowerCase().replace(/[#*\d]/g, "").replace(/\s+/g, " ").trim().slice(0, 32);
   }
 
+  // ---------------------------------------------------------------- pay stubs
+
+  // Net-pay labels in priority order: the first label that yields a dollar
+  // amount wins, and the first amount after the label is the current period
+  // (the second is usually the YTD column). Mirrors importers.parse_paystub_text.
+  const STUB_NET_LABELS = ["net pay", "net check", "net amount", "take home", "total net",
+    "net earnings", "net deposit", "amount deposited", "deposit amount",
+    "check amount", "direct deposit"];
+  const STUB_GROSS_LABELS = ["gross pay", "total gross", "gross earnings", "total earnings"];
+  const STUB_DATE_LABELS = ["pay date", "check date", "date paid", "deposit date",
+    "payment date", "advice date", "period end"];
+  const STUB_DATE_RE = "(\\d{4}-\\d{2}-\\d{2}|\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}|[A-Za-z]{3,9}\\.? \\d{1,2},? \\d{4})";
+  const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7,
+    sep: 8, oct: 9, nov: 10, dec: 11 };
+
+  function stubAmount(labels, text) {
+    for (const label of labels) {
+      for (const m of text.matchAll(new RegExp(label + "\\W{0,20}?" + MONEY_RE, "gi"))) {
+        const value = Number(m[1].replace(/,/g, ""));
+        if (value > 0) return value;
+      }
+    }
+    return null;
+  }
+
+  function stubDate(raw) {
+    raw = raw.replace(".", "").trim();
+    let m = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) return raw;
+    m = raw.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
+    if (m) {
+      const year = m[3].length === 2 ? "20" + m[3] : m[3];
+      return `${year}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+    }
+    m = raw.match(/^([A-Za-z]{3,9}) (\d{1,2}),? (\d{4})$/);
+    if (m && MONTHS[m[1].slice(0, 3).toLowerCase()] !== undefined) {
+      return `${m[3]}-${String(MONTHS[m[1].slice(0, 3).toLowerCase()] + 1).padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+    }
+    return "";
+  }
+
+  function parsePaystubText(text) {
+    const net = stubAmount(STUB_NET_LABELS, text);
+    const gross = stubAmount(STUB_GROSS_LABELS, text);
+    const amount = net || gross;
+    if (!amount) return null;
+    let date = "";
+    for (const label of STUB_DATE_LABELS) {
+      const m = text.match(new RegExp(label + "\\W{0,20}?" + STUB_DATE_RE, "i"));
+      if (m) {
+        date = stubDate(m[1]);
+        if (date) break;
+      }
+    }
+    let source = "";
+    for (let line of text.split(/\r?\n/)) {
+      line = line.replace(/\s+/g, " ").trim();
+      if (line.replace(/[^A-Za-z]/g, "").length >= 3 &&
+          !/earnings statement|pay ?stub|payroll advice|statement of/i.test(line)) {
+        source = line.slice(0, 32);
+        break;
+      }
+    }
+    return { amount: r2(amount), net: net !== null, date, source: source || "Paycheck" };
+  }
+
   // ---------------------------------------------------------------- cut plan
 
   // Known brands, grouped so "DOORDASH*TACOS" and "DOORDASH*WINGS" are one
@@ -1521,6 +1589,11 @@
         if (!amount || isNaN(amount)) throw new Error("Bad request: amount");
         const payDate = (body.date || todayISO()).slice(0, 10);
         return { plan: buildAndApplyPlan(db, amount, payDate, body.source || "Paycheck", !body.preview) };
+      }
+
+      case "/api/paycheck/parse": {
+        const stub = parsePaystubText((body && body.text) || "");
+        return { found: Boolean(stub), stub };
       }
 
       case "/api/paycheck/delete":

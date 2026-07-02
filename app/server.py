@@ -257,6 +257,9 @@ class Handler(BaseHTTPRequestHandler):
                 plan = build_and_apply_plan(conn, amount, pay_date, source,
                                             apply_changes=not preview)
                 self._json({"plan": plan})
+            elif route == "/api/paycheck/parse":
+                stub = importers.parse_paystub_text(body.get("text", ""))
+                self._json({"found": bool(stub), "stub": stub})
             elif route == "/api/paycheck/delete":
                 db.delete_paycheck(conn, body["id"])
                 self._json({"ok": True})

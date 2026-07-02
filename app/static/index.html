@@ -59,8 +59,13 @@
       <button type="button" id="pc-preview" class="ghost">Preview plan</button>
       <button type="submit" class="primary">Create plan</button>
     </form>
-    <p class="muted small">“Preview” shows the plan without saving. “Create plan” saves it, updates bill set-asides,
-      applies payments to your debt balances and moves the emergency-fund contribution.</p>
+    <div class="row-form">
+      <label>Or upload your pay stub <input type="file" id="pc-file" accept=".pdf,.txt"></label>
+    </div>
+    <p class="muted small">Upload the pay stub <b>PDF</b> and the net pay, date and employer are read on your
+      device and filled in above — review, then “Create plan”. “Preview” shows the plan without saving.
+      “Create plan” saves it, updates bill set-asides, applies payments to your debt balances and moves the
+      emergency-fund contribution.</p>
   </div>
   <div class="panel" id="plan-output" style="display:none"></div>
   <div class="panel">

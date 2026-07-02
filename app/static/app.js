@@ -79,6 +79,29 @@ async function loadState() {
 
 // ------------------------------------------------------------- dashboard
 
+// Bills (minus what's already set aside) and debt minimums whose monthly due
+// day lands within the next `days` days.
+function dueWithinDays(days) {
+  const today = new Date((STATE.today || new Date().toISOString().slice(0, 10)) + "T00:00:00");
+  const inWindow = (dueDay) => {
+    const day = Math.max(1, Math.min(28, dueDay));
+    const due = new Date(today);
+    due.setDate(day);
+    if (due < today) due.setMonth(due.getMonth() + 1);
+    return (due - today) / 86400000 <= days;
+  };
+  let total = 0;
+  for (const b of STATE.bills) {
+    if (inWindow(b.due_day)) total += Math.max(0, b.amount - (b.reserved || 0));
+  }
+  for (const d of STATE.debts) {
+    if (d.balance > 0 && d.min_payment > 0 && inWindow(d.due_day)) {
+      total += Math.min(d.min_payment, d.balance);
+    }
+  }
+  return { total: Math.round(total * 100) / 100 };
+}
+
 function renderDashboard() {
   const { debts, bills, settings, budget, paychecks } = STATE;
   const totalDebt = debts.reduce((s, d) => s + d.balance, 0);
@@ -87,7 +110,29 @@ function renderDashboard() {
   const ef = Number(settings.emergency_balance);
   const efT = Number(settings.emergency_target);
 
+  // live bank balance vs what's due in the next 14 days
+  const balance = settings.bank_balance === "" ? null : Number(settings.bank_balance);
+  const dueSoon = dueWithinDays(14);
+  let balSub = "tap to set your checking balance";
+  let balClass = "";
+  if (balance !== null) {
+    balSub = balance >= dueSoon.total
+      ? `covers the ${money(dueSoon.total)} due in the next 14 days ✓`
+      : `short ${money(dueSoon.total - balance)} of the ${money(dueSoon.total)} due in the next 14 days`;
+    balClass = balance >= dueSoon.total ? "good" : "bad";
+    if (settings.bank_balance_updated) balSub += ` · updated ${fmtDate(settings.bank_balance_updated)}`;
+  }
+
   $("#dash-cards").innerHTML = `
+    <div class="card ${balClass}">
+      <div class="label">Bank balance (live)</div>
+      <div class="value">${balance === null ? "—" : money(balance)}</div>
+      <div class="sub">${balSub}</div>
+      <div class="row-form" style="margin-top:6px">
+        <input type="number" step="0.01" id="dash-balance" placeholder="current balance" style="width:130px">
+        <button class="mini" id="dash-balance-save">update</button>
+      </div>
+    </div>
     <div class="card ${totalDebt > 0 ? "bad" : "good"}">
       <div class="label">Total debt</div><div class="value">${money(totalDebt)}</div>
       <div class="sub">${debts.filter((d) => d.balance > 0).length} active account(s)</div>
@@ -108,6 +153,16 @@ function renderDashboard() {
       <div class="label">Emergency fund</div><div class="value">${money(ef)}</div>
       <div class="sub">target ${money(efT)}</div>
     </div>`;
+  $("#dash-balance-save").addEventListener("click", async () => {
+    const v = $("#dash-balance").value;
+    if (v === "") { toast("Enter your current balance first."); return; }
+    await api("/api/settings", {
+      bank_balance: String(Number(v)),
+      bank_balance_updated: STATE.today || new Date().toISOString().slice(0, 10),
+    });
+    toast("Balance updated.");
+    await loadState();
+  });
 
   const latest = paychecks[0];
   if (latest && latest.plan) {
@@ -154,6 +209,38 @@ async function loadDashOutlook() {
 }
 
 // ------------------------------------------------------------- paycheck
+
+// Upload a pay stub: text is extracted on-device (pdf.js) and the parsed net
+// pay/date/employer fill the form for review — nothing is saved until
+// "Create plan".
+$("#pc-file").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    let text;
+    if (/\.pdf$/i.test(f.name) || f.type === "application/pdf") {
+      toast(`Reading ${f.name}…`);
+      text = await extractPdfText(f);
+    } else {
+      text = await f.text();
+    }
+    const { found, stub } = await api("/api/paycheck/parse", { text });
+    if (!found) {
+      toast(`${f.name}: couldn't find a pay amount — enter it manually.`);
+      return;
+    }
+    $("#pc-amount").value = stub.amount;
+    if (stub.date) $("#pc-date").value = stub.date;
+    if (stub.source) $("#pc-source").value = stub.source;
+    toast(stub.net
+      ? `Read ${money(stub.amount)} net pay${stub.date ? " on " + fmtDate(stub.date) : ""} — review, then Create plan.`
+      : `Only found GROSS pay ${money(stub.amount)} — enter your net (take-home) amount before creating the plan.`);
+  } catch (err) {
+    toast(`${f.name}: ${err.message}`);
+  } finally {
+    e.target.value = "";
+  }
+});
 
 $("#pc-date").value = new Date().toISOString().slice(0, 10);
 

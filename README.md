@@ -15,6 +15,11 @@ Everything runs 100% locally — your financial data never leaves your computer.
 ## Features
 
 **Paycheck autopilot**
+- Upload your pay stub **PDF** and the net pay, pay date and employer are
+  read on your device and filled in for review — or type the amount in.
+- Keep a **live bank balance** on the dashboard: enter/adjust it any time
+  and see whether it covers the bills and debt minimums due in the next
+  14 days, or exactly how short you are.
 - Enter a paycheck and get a dollar-by-dollar plan, in priority order:
   1. Bills and debt minimums due before your next paycheck — paid in full.
   2. Bills due later — a share is set aside each paycheck (sinking funds), so

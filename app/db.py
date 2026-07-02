@@ -19,6 +19,8 @@ DEFAULT_SETTINGS = {
     "fun_pct": "5",                # % of leftover kept as guilt-free spending money
     "variable_budget": "600",      # monthly budget for groceries/gas/day-to-day essentials
     "monthly_net_income": "0",     # 0 = estimate from recent paychecks
+    "bank_balance": "",            # live checking balance, user-updated
+    "bank_balance_updated": "",    # ISO date of the last balance update
 }
 
 SCHEMA = """

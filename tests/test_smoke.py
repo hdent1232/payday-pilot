@@ -262,6 +262,17 @@ class SmokeTest(unittest.TestCase):
         self.assertTrue(advice["target_debt"])
         self.assertIn("months", advice["boosted"])
 
+        # -- pay stub upload parses net pay for the paycheck form
+        parsed_stub = self.call("/api/paycheck/parse", {"text": PAYSTUB_TEXT})
+        self.assertTrue(parsed_stub["found"])
+        self.assertEqual(parsed_stub["stub"]["amount"], 1719.68)
+
+        # -- live bank balance persists through settings
+        self.call("/api/settings", {"bank_balance": "412.55", "bank_balance_updated": "2026-07-01"})
+        settings = self.call("/api/state")["settings"]
+        self.assertEqual(settings["bank_balance"], "412.55")
+        self.assertEqual(settings["bank_balance_updated"], "2026-07-01")
+
         # -- export contains everything
         export = self.call("/api/export")
         for key in ("settings", "debts", "bills", "paychecks", "transactions", "rules"):
@@ -464,6 +475,42 @@ class AdviceTest(unittest.TestCase):
         # settings/paycheck income still wins when present
         b2 = estimate_monthly_extra([], [], settings | {"monthly_net_income": "3000"}, [], txns)
         self.assertEqual(b2["monthly_income"], 3000.0)
+
+
+PAYSTUB_TEXT = """ACME MANUFACTURING LLC
+Earnings Statement
+Pay Period: 06/08/2026 - 06/21/2026 Pay Date: 06/26/2026
+Earnings rate hours this period year to date
+Regular 24.00 80.00 1,920.00 23,040.00
+Overtime 36.00 4.00 144.00 900.00
+Gross Pay $2,064.00 $23,940.00
+Deductions Statutory
+Federal Income Tax -186.42 2,236.11
+Social Security Tax -127.97 1,484.28
+Medicare Tax -29.93 347.13
+Net Pay $1,719.68
+Net Check $1,719.68 $19,872.48
+"""
+
+
+class PaystubTest(unittest.TestCase):
+    def test_parse_paystub(self):
+        from app.importers import parse_paystub_text
+        stub = parse_paystub_text(PAYSTUB_TEXT)
+        self.assertEqual(stub["amount"], 1719.68)   # net, current period not YTD
+        self.assertTrue(stub["net"])
+        self.assertEqual(stub["date"], "2026-06-26")
+        self.assertEqual(stub["source"], "ACME MANUFACTURING LLC")
+
+    def test_gross_only_flagged(self):
+        from app.importers import parse_paystub_text
+        stub = parse_paystub_text("MEGACORP\nPay Date: 07/03/2026\nGross Pay $2,064.00")
+        self.assertEqual(stub["amount"], 2064.00)
+        self.assertFalse(stub["net"])               # UI warns: not take-home
+
+    def test_no_paycheck_found(self):
+        from app.importers import parse_paystub_text
+        self.assertIsNone(parse_paystub_text("A Summary of Your Rights Under the FCRA"))
 
 
 class CutPlanTest(unittest.TestCase):
