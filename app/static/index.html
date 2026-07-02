@@ -26,6 +26,11 @@
 <!-- ================================ DASHBOARD ================================ -->
 <section id="tab-dashboard" class="tab active">
   <div class="cards" id="dash-cards"></div>
+  <div class="panel">
+    <h2>Your action plan</h2>
+    <div id="dash-actions" class="muted">Add your bills and debts, then import a bank statement —
+      the app turns them into a dated to-do list: pay this there on that day, stop spending here.</div>
+  </div>
   <div class="grid2">
     <div class="panel">
       <h2>Latest paycheck plan</h2>
@@ -60,12 +65,14 @@
       <button type="submit" class="primary">Create plan</button>
     </form>
     <div class="row-form">
-      <label>Or upload your pay stub <input type="file" id="pc-file" accept=".pdf,.txt"></label>
+      <label>Or upload pay stubs <input type="file" id="pc-file" accept=".pdf,.txt" multiple></label>
     </div>
-    <p class="muted small">Upload the pay stub <b>PDF</b> and the net pay, date and employer are read on your
-      device and filled in above — review, then “Create plan”. “Preview” shows the plan without saving.
-      “Create plan” saves it, updates bill set-asides, applies payments to your debt balances and moves the
-      emergency-fund contribution.</p>
+    <p class="muted small">Upload one pay stub <b>PDF</b> and the net pay, date and employer are read on your
+      device and filled in above for review. Select <b>several stubs at once</b> and they're imported into your
+      paycheck history instead — the app learns how often you're paid and how much, and uses that for income
+      estimates and the next-payday prediction (history import never moves money). “Preview” shows the plan
+      without saving. “Create plan” saves it, updates bill set-asides, applies payments to your debt balances
+      and moves the emergency-fund contribution.</p>
   </div>
   <div class="panel" id="plan-output" style="display:none"></div>
   <div class="panel">
@@ -237,7 +244,8 @@
   <div class="panel">
     <h2>Category rules</h2>
     <p class="muted small">Custom keyword → category rules used when importing bank statements
-      (checked before the built-in rules).</p>
+      (checked before the built-in rules). Payments toward tracked debts are recognized automatically.
+      <button class="mini ghost" id="recategorize" type="button">Re-categorize all transactions</button></p>
     <div id="rules-list"></div>
     <form id="rule-form" class="row-form">
       <label>If description contains <input id="r-keyword" placeholder="e.g. chewy" required></label>

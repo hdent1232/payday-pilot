@@ -309,6 +309,28 @@ def _add_months(d, months):
     return date(year, month, day)
 
 
+def paycheck_pattern(paychecks):
+    """Pay cadence learned from paycheck history: median gap between checks,
+    typical (median) amount, and the predicted next payday. Needs >= 3 checks."""
+    if len(paychecks) < 3:
+        return None
+    dates = sorted(parse_date(p["date"]) for p in paychecks)[-10:]
+    gaps = [(b - a).days for a, b in zip(dates, dates[1:]) if 1 <= (b - a).days <= 45]
+    if not gaps:
+        return None
+    gaps.sort()
+    gap = gaps[len(gaps) // 2]
+    frequency = min(PERIOD_DAYS, key=lambda f: abs(PERIOD_DAYS[f] - gap))
+    amounts = sorted(p["amount"] for p in paychecks[:6])
+    return {
+        "gap_days": gap,
+        "frequency": frequency,
+        "typical_amount": round(amounts[len(amounts) // 2], 2),
+        "next_payday": (dates[-1] + timedelta(days=gap)).isoformat(),
+        "checks_seen": len(paychecks),
+    }
+
+
 def estimate_monthly_extra(bills, debts, settings, recent_paychecks, transactions=None):
     """Best estimate of how much can go to extra debt payments each month.
 
@@ -316,6 +338,10 @@ def estimate_monthly_extra(bills, debts, settings, recent_paychecks, transaction
     Income-category deposits from imported bank statements.
     """
     income = float(settings["monthly_net_income"])
+    pattern = paycheck_pattern(recent_paychecks) if recent_paychecks else None
+    if income <= 0 and pattern:
+        # learned cadence beats the settings dropdown: typical check x checks/month
+        income = pattern["typical_amount"] * AVG_DAYS_PER_MONTH / pattern["gap_days"]
     if income <= 0 and recent_paychecks:
         checks = recent_paychecks[:8]
         avg = sum(p["amount"] for p in checks) / len(checks)
@@ -341,6 +367,7 @@ def estimate_monthly_extra(bills, debts, settings, recent_paychecks, transaction
         "monthly_essentials": round(variable, 2),
         "monthly_fun": round(fun, 2),
         "monthly_extra": round(max(0.0, leftover - fun), 2),
+        "pattern": pattern,
     }
 
 

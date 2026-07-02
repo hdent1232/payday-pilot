@@ -143,7 +143,9 @@ function renderDashboard() {
     </div>
     <div class="card">
       <div class="label">Est. monthly income</div><div class="value">${money(budget.monthly_income)}</div>
-      <div class="sub">${budget.monthly_income ? "" : "enter a paycheck or set income in Settings"}</div>
+      <div class="sub">${budget.pattern
+        ? `paid ${budget.pattern.frequency} (~${money(budget.pattern.typical_amount)}) · next payday ~${fmtDate(budget.pattern.next_payday)}`
+        : budget.monthly_income ? "" : "upload pay stubs or import statements"}</div>
     </div>
     <div class="card ${budget.monthly_extra > 0 ? "good" : "warn"}">
       <div class="label">Free for extra debt payoff</div><div class="value">${money(budget.monthly_extra)}</div>
@@ -173,10 +175,70 @@ function renderDashboard() {
   loadDashOutlook();
 }
 
+// The whole point of the app in one panel: a dated, ordered to-do list.
+// Pay these bills/minimums on these days, send the leftover to this debt,
+// and stop this specific spending to make it bigger.
+function renderActionPlan(p) {
+  const el = $("#dash-actions");
+  const today = new Date((STATE.today || new Date().toISOString().slice(0, 10)) + "T00:00:00");
+  const nextDue = (dueDay) => {
+    const due = new Date(today);
+    due.setDate(Math.max(1, Math.min(28, dueDay)));
+    if (due < today) due.setMonth(due.getMonth() + 1);
+    return due;
+  };
+  const steps = [];
+  for (const b of STATE.bills) {
+    const owed = Math.max(0, b.amount - (b.reserved || 0));
+    if (owed > 0.01) {
+      steps.push({ date: nextDue(b.due_day), badge: "bill", label: `Pay ${b.name}`,
+        amount: owed, note: b.reserved > 0.01 ? `${money(b.reserved)} already set aside` : b.category });
+    }
+  }
+  for (const d of STATE.debts) {
+    if (d.balance > 0.01 && d.min_payment > 0.01) {
+      steps.push({ date: nextDue(d.due_day), badge: "debt_min",
+        label: `Pay ${d.name} minimum`, amount: Math.min(d.min_payment, d.balance),
+        note: `${d.apr_estimated ? "~" : ""}${d.apr.toFixed(2)}% APR, ${money(d.balance)} left` });
+    }
+  }
+  if (!steps.length && !STATE.debts.length) {
+    el.textContent = "Add your bills and debts, then import a bank statement — the app turns them " +
+      "into a dated to-do list: pay this there on that day, stop spending here.";
+    return;
+  }
+  steps.sort((a, b) => a.date - b.date);
+  const within30 = steps.filter((s) => (s.date - today) / 86400000 <= 30);
+  let html = within30.map((s) => `<div class="plan-item">
+      <span class="badge ${s.badge}">${fmtDate(s.date.toISOString().slice(0, 10))}</span>
+      <span><span class="what">${esc(s.label)}</span><br><span class="why">${esc(s.note)}</span></span>
+      <span class="amt">${money(s.amount)}</span></div>`).join("");
+  // then: everything left goes to the strategy target
+  const target = p && p.advice && p.advice.target_debt;
+  const extra = p ? p.extra_used : STATE.budget.monthly_extra;
+  if (target && extra > 0) {
+    html += `<div class="plan-item"><span class="badge debt_extra">every payday</span>
+      <span><span class="what">Send everything left to ${esc(target)}</span><br>
+      <span class="why">~${money(extra)}/mo extra — ${STATE.settings.strategy} target</span></span>
+      <span class="amt">${money(extra)}/mo</span></div>`;
+  }
+  // and: the specific spending to stop, feeding that payment
+  if (p && p.advice && p.advice.suggestions.length) {
+    for (const s of p.advice.suggestions.slice(0, 3)) {
+      html += `<div class="plan-item"><span class="badge fun">${esc(s.action)}</span>
+        <span><span class="what">${{ cancel: "Cancel", eliminate: "Stop", squeeze: "Squeeze" }[s.action] || "Halve"} ${esc(s.label)}</span><br>
+        <span class="why">${esc(s.message)}</span></span>
+        <span class="amt">+${money(s.suggested_cut)}/mo${target ? " → " + esc(target) : ""}</span></div>`;
+    }
+  }
+  el.innerHTML = html || "Nothing due in the next 30 days.";
+}
+
 async function loadDashOutlook() {
   const el = $("#dash-outlook");
   const debts = STATE.debts.filter((d) => d.balance > 0);
   if (!debts.length) {
+    renderActionPlan(null);
     el.innerHTML = STATE.debts.length
       ? "<div class='okbox'>🎉 All debts are paid off!</div>"
       : "Add your debts to see a payoff projection.";
@@ -184,6 +246,7 @@ async function loadDashOutlook() {
   }
   try {
     const p = await api("/api/projection");
+    renderActionPlan(p);
     const s = p.comparison[STATE.settings.strategy];
     const minOnly = p.comparison.minimum_only;
     if (s.stuck) {
@@ -204,6 +267,7 @@ async function loadDashOutlook() {
     }
     el.innerHTML = html;
   } catch (e) {
+    renderActionPlan(null);
     el.textContent = "Couldn't compute projection: " + e.message;
   }
 }
@@ -214,32 +278,57 @@ async function loadDashOutlook() {
 // pay/date/employer fill the form for review — nothing is saved until
 // "Create plan".
 $("#pc-file").addEventListener("change", async (e) => {
-  const f = e.target.files[0];
-  if (!f) return;
-  try {
-    let text;
-    if (/\.pdf$/i.test(f.name) || f.type === "application/pdf") {
+  const files = [...e.target.files];
+  e.target.value = "";
+  if (!files.length) return;
+  const readStub = async (f) => {
+    const text = /\.pdf$/i.test(f.name) || f.type === "application/pdf"
+      ? await extractPdfText(f) : await f.text();
+    return (await api("/api/paycheck/parse", { text })).stub;
+  };
+  // one file: prefill the form for review
+  if (files.length === 1) {
+    const f = files[0];
+    try {
       toast(`Reading ${f.name}…`);
-      text = await extractPdfText(f);
-    } else {
-      text = await f.text();
+      const stub = await readStub(f);
+      if (!stub) { toast(`${f.name}: couldn't find a pay amount — enter it manually.`); return; }
+      $("#pc-amount").value = stub.amount;
+      if (stub.date) $("#pc-date").value = stub.date;
+      if (stub.source) $("#pc-source").value = stub.source;
+      toast(stub.net
+        ? `Read ${money(stub.amount)} net pay${stub.date ? " on " + fmtDate(stub.date) : ""} — review, then Create plan.`
+        : `Only found GROSS pay ${money(stub.amount)} — enter your net (take-home) amount before creating the plan.`);
+    } catch (err) {
+      toast(`${f.name}: ${err.message}`);
     }
-    const { found, stub } = await api("/api/paycheck/parse", { text });
-    if (!found) {
-      toast(`${f.name}: couldn't find a pay amount — enter it manually.`);
-      return;
-    }
-    $("#pc-amount").value = stub.amount;
-    if (stub.date) $("#pc-date").value = stub.date;
-    if (stub.source) $("#pc-source").value = stub.source;
-    toast(stub.net
-      ? `Read ${money(stub.amount)} net pay${stub.date ? " on " + fmtDate(stub.date) : ""} — review, then Create plan.`
-      : `Only found GROSS pay ${money(stub.amount)} — enter your net (take-home) amount before creating the plan.`);
-  } catch (err) {
-    toast(`${f.name}: ${err.message}`);
-  } finally {
-    e.target.value = "";
+    return;
   }
+  // many files: import into history so the app learns the pay pattern —
+  // no plans are run, no balances change
+  toast(`Reading ${files.length} pay stubs…`);
+  const items = [];
+  const failed = [];
+  for (const f of files) {
+    try {
+      const stub = await readStub(f);
+      if (stub && stub.date) items.push(stub);
+      else failed.push(f.name);
+    } catch (err) {
+      failed.push(f.name);
+    }
+  }
+  if (!items.length) { toast("Couldn't read a pay amount + date from any of those files."); return; }
+  const r = await api("/api/paycheck/history", { items });
+  let msg = `Imported ${r.added} paycheck(s) into history` +
+    (r.duplicates ? `, skipped ${r.duplicates} duplicate(s)` : "") + ".";
+  if (r.pattern) {
+    msg += ` Pay pattern: ${r.pattern.frequency}, ~${money(r.pattern.typical_amount)} — ` +
+      `next payday ~${fmtDate(r.pattern.next_payday)}.`;
+  }
+  if (failed.length) msg += ` Couldn't read: ${failed.join(", ")}.`;
+  toast(msg);
+  await loadState();
 });
 
 $("#pc-date").value = new Date().toISOString().slice(0, 10);
@@ -711,6 +800,7 @@ $("#bank-import").addEventListener("click", async () => {
       }
       added += r.added; dupes += r.duplicates;
       if (r.note) notes.push(`${f.name}: ${r.note}`);
+      if (r.due_day_updates) notes.push(...r.due_day_updates);
       if (!r.parsed && !r.note) {
         notes.push(`${f.name}: no transactions found — check that it has Date and Amount columns.`);
       }
@@ -722,6 +812,7 @@ $("#bank-import").addEventListener("click", async () => {
     `Imported <b>${added}</b> transaction(s)` + (dupes ? `, skipped ${dupes} duplicate(s)` : "") + "." +
     (notes.length ? `<br><span class="small">${notes.map(esc).join("<br>")}</span>` : "");
   $("#bank-file").value = "";
+  await loadState(); // due days may have been inferred; dashboard plan changes
   loadSpending();
 });
 
@@ -820,7 +911,9 @@ function renderSettings() {
   $("#s-ebalance").value = s.emergency_balance;
   $("#s-epct").value = s.emergency_pct;
   $("#s-fun").value = s.fun_pct;
-  $("#s-income").value = s.monthly_net_income;
+  $("#s-income").value = Number(s.monthly_net_income) > 0 ? s.monthly_net_income : "";
+  $("#s-income").placeholder = STATE.budget && STATE.budget.monthly_income
+    ? `auto: ${STATE.budget.monthly_income} (from paychecks/statements)` : "0";
   loadRules();
 }
 
@@ -834,7 +927,7 @@ $("#settings-form").addEventListener("submit", async (e) => {
     emergency_balance: $("#s-ebalance").value,
     emergency_pct: $("#s-epct").value,
     fun_pct: $("#s-fun").value,
-    monthly_net_income: $("#s-income").value,
+    monthly_net_income: $("#s-income").value || "0",
   });
   toast("Settings saved.");
   await loadState();
@@ -852,6 +945,12 @@ async function loadRules() {
     loadRules();
   }));
 }
+
+$("#recategorize").addEventListener("click", async () => {
+  const r = await api("/api/transactions/recategorize", {});
+  toast(`Re-categorized ${r.changed} transaction(s).`);
+  loadSpending();
+});
 
 $("#rule-form").addEventListener("submit", async (e) => {
   e.preventDefault();

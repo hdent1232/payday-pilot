@@ -260,18 +260,63 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/paycheck/parse":
                 stub = importers.parse_paystub_text(body.get("text", ""))
                 self._json({"found": bool(stub), "stub": stub})
+            elif route == "/api/paycheck/history":
+                # bulk history import (from pay stub uploads): records income
+                # for pattern learning WITHOUT running allocation plans or
+                # touching balances
+                existing = {(p["date"], round(p["amount"], 2))
+                            for p in db.list_paychecks(conn, limit=100000)}
+                added = 0
+                for item in body.get("items", []):
+                    amount = round(float(item.get("amount") or 0), 2)
+                    date_s = str(item.get("date") or "")[:10]
+                    if amount <= 0 or len(date_s) != 10 or (date_s, amount) in existing:
+                        continue
+                    db.add_paycheck(conn, str(item.get("source") or "Paycheck")[:40],
+                                    amount, date_s, None)
+                    existing.add((date_s, amount))
+                    added += 1
+                paychecks = db.list_paychecks(conn, limit=100000)
+                self._json({"added": added,
+                            "duplicates": len(body.get("items", [])) - added,
+                            "pattern": engine.paycheck_pattern(paychecks)})
             elif route == "/api/paycheck/delete":
                 db.delete_paycheck(conn, body["id"])
                 self._json({"ok": True})
             elif route == "/api/transactions/import":
-                rules = importers.merge_rules(db.list_rules(conn))
+                debts = db.list_debts(conn)
+                rules = importers.merge_rules(db.list_rules(conn), debts)
                 if body.get("statement"):
                     txns, note = importers.parse_statement_text(body["statement"], rules)
                 else:
                     txns, note = importers.parse_bank_csv(body.get("csv", ""), rules)
                 added = db.add_transactions(conn, txns)
+                # the statement reveals when debt payments actually post —
+                # use that to fill in due days still sitting at the default
+                all_txns = db.list_transactions(conn, limit=10000)
+                inferred = importers.infer_debt_due_days(debts, all_txns)
+                due_notes = []
+                for d in debts:
+                    day = inferred.get(d["id"])
+                    if day and day != 1 and d["due_day"] == 1:
+                        db.upsert_debt(conn, {**d, "due_day": day})
+                        due_notes.append(f"{d['name']}: due day set to day {day} of the month "
+                                         "(from your payment history)")
                 self._json({"parsed": len(txns), "added": added,
-                            "duplicates": len(txns) - added, "note": note})
+                            "duplicates": len(txns) - added, "note": note,
+                            "due_day_updates": due_notes})
+            elif route == "/api/transactions/recategorize":
+                debts = db.list_debts(conn)
+                rules = importers.merge_rules(db.list_rules(conn), debts)
+                changed = 0
+                for t in db.list_transactions(conn, limit=100000):
+                    cat = importers.categorize(t["description"], rules)
+                    if t["amount"] > 0 and cat == "Other":
+                        cat = t["category"]  # keep existing guess for deposits
+                    if cat != t["category"]:
+                        db.update_transaction_category(conn, t["id"], cat)
+                        changed += 1
+                self._json({"changed": changed})
             elif route == "/api/transactions/clear":
                 db.delete_transactions(conn)
                 self._json({"ok": True})

@@ -341,10 +341,42 @@
     };
   }
 
-  // Income source, in order: the Settings value, recorded paychecks, then
-  // Income-category deposits from imported bank statements.
+  // Pay cadence learned from paycheck history: median gap between checks,
+  // typical (median) amount, and the predicted next payday. Needs >= 3 checks.
+  function paycheckPattern(paychecks) {
+    if (paychecks.length < 3) return null;
+    const dates = paychecks.map((p) => p.date).sort().slice(-10);
+    const gaps = [];
+    for (let i = 1; i < dates.length; i++) {
+      const g = Math.round((new Date(dates[i] + "T00:00:00") - new Date(dates[i - 1] + "T00:00:00")) / 86400000);
+      if (g >= 1 && g <= 45) gaps.push(g);
+    }
+    if (!gaps.length) return null;
+    gaps.sort((a, b) => a - b);
+    const gap = gaps[Math.floor(gaps.length / 2)];
+    let frequency = "biweekly", best = 99;
+    for (const [f, days] of Object.entries(PERIOD_DAYS)) {
+      if (Math.abs(days - gap) < best) { best = Math.abs(days - gap); frequency = f; }
+    }
+    const amounts = paychecks.slice(0, 6).map((p) => p.amount).sort((a, b) => a - b);
+    const next = new Date(dates[dates.length - 1] + "T00:00:00");
+    next.setDate(next.getDate() + gap);
+    return {
+      gap_days: gap, frequency,
+      typical_amount: r2(amounts[Math.floor(amounts.length / 2)]),
+      next_payday: next.toISOString().slice(0, 10),
+      checks_seen: paychecks.length,
+    };
+  }
+
+  // Income source, in order: the Settings value, the learned pay pattern,
+  // recorded paychecks, then Income deposits from imported bank statements.
   function estimateMonthlyExtra(bills, debts, settings, recentPaychecks, transactions) {
     let income = Number(settings.monthly_net_income);
+    const pattern = recentPaychecks.length ? paycheckPattern(recentPaychecks) : null;
+    if (income <= 0 && pattern) {
+      income = pattern.typical_amount * AVG_DAYS_PER_MONTH / pattern.gap_days;
+    }
     if (income <= 0 && recentPaychecks.length) {
       const checks = recentPaychecks.slice(0, 8);
       const avg = checks.reduce((s, p) => s + p.amount, 0) / checks.length;
@@ -376,6 +408,7 @@
       monthly_essentials: r2(variable),
       monthly_fun: r2(fun),
       monthly_extra: r2(Math.max(0, leftover - fun)),
+      pattern,
     };
   }
 
@@ -423,7 +456,22 @@
     ["cvs", "Health & Fitness"], ["walgreens", "Health & Fitness"],
     ["doctor", "Health & Fitness"], ["dental", "Health & Fitness"],
     ["geico", "Insurance"], ["progressive", "Insurance"], ["state farm", "Insurance"],
-    ["allstate", "Insurance"], ["insurance", "Insurance"],
+    ["allstate", "Insurance"], ["insurance", "Insurance"], ["root ins", "Insurance"],
+    ["lemonade", "Insurance"], ["usaa", "Insurance"], ["liberty mutual", "Insurance"],
+    ["farmers ins", "Insurance"], ["nationwide", "Insurance"], ["the general", "Insurance"],
+    ["gainsco", "Insurance"],
+    ["discount tire", "Car & Maintenance"], ["firestone", "Car & Maintenance"],
+    ["jiffy lube", "Car & Maintenance"], ["take 5", "Car & Maintenance"],
+    ["valvoline", "Car & Maintenance"], ["strickland", "Car & Maintenance"],
+    ["autozone", "Car & Maintenance"], ["o'reilly", "Car & Maintenance"],
+    ["oreilly", "Car & Maintenance"], ["advance auto", "Car & Maintenance"],
+    ["pep boys", "Car & Maintenance"], ["oil change", "Car & Maintenance"],
+    ["tire", "Car & Maintenance"], ["car wash", "Car & Maintenance"],
+    ["turbotax", "Taxes & Fees"], ["intuit", "Taxes & Fees"], ["h&r block", "Taxes & Fees"],
+    ["irs treas", "Taxes & Fees"], ["tax payment", "Taxes & Fees"],
+    ["hinge", "Subscriptions"], ["tinder", "Subscriptions"], ["bumble", "Subscriptions"],
+    ["chime", "Transfers"], ["varo", "Transfers"], ["apple cash", "Transfers"],
+    ["discover e-pay", "Debt Payment"], ["discover payment", "Debt Payment"],
     ["steam", "Entertainment"], ["playstation", "Entertainment"], ["xbox", "Entertainment"],
     ["cinema", "Entertainment"], ["theatre", "Entertainment"], ["ticketmaster", "Entertainment"],
     ["365 market", "Dining"], ["aramark", "Dining"], ["waffle house", "Dining"],
@@ -443,11 +491,47 @@
 
   const DISCRETIONARY = new Set(["Dining", "Subscriptions", "Shopping", "Entertainment", "Other", "Cash"]);
   const ESSENTIAL_RECURRING = new Set(["Housing", "Utilities", "Phone", "Insurance", "Groceries",
-    "Gas & Fuel", "Debt Payment", "Transfers", "Income"]);
+    "Gas & Fuel", "Debt Payment", "Transfers", "Income", "Car & Maintenance", "Taxes & Fees"]);
 
-  function mergeRules(userRules) {
+  // Words too generic to identify a debt by ("SERVICES" would match anything).
+  const GENERIC_DEBT_WORDS = new Set(["service", "services", "financia", "financial", "national",
+    "credit", "america", "united", "collect", "collecti", "account", "payment", "bank"]);
+
+  function debtKeywords(name) {
+    return ((name || "").match(/[A-Za-z]{6,}/g) || [])
+      .map((w) => w.slice(0, 8).toLowerCase())
+      .filter((w) => !GENERIC_DEBT_WORDS.has(w));
+  }
+
+  // Payments toward tracked debts are Debt Payment, never cuttable spending.
+  function debtPaymentRules(debts) {
+    const rules = [];
+    for (const d of debts) {
+      for (const kw of debtKeywords(d.name)) rules.push({ keyword: kw, category: "Debt Payment" });
+    }
+    return rules;
+  }
+
+  function mergeRules(userRules, debts) {
     return userRules.map((r) => ({ keyword: r.keyword.toLowerCase(), category: r.category }))
+      .concat(debts ? debtPaymentRules(debts) : [])
       .concat(DEFAULT_RULES.map(([k, c]) => ({ keyword: k, category: c })));
+  }
+
+  // Debt due days from the days their payments actually post: the median
+  // day-of-month of the payments toward each debt.
+  function inferDebtDueDays(debts, transactions) {
+    const out = {};
+    for (const d of debts) {
+      const kws = debtKeywords(d.name);
+      if (!kws.length) continue;
+      const days = transactions
+        .filter((t) => t.amount < 0 && kws.some((k) => t.description.toLowerCase().includes(k)))
+        .map((t) => Number(t.date.slice(8, 10)))
+        .sort((a, b) => a - b);
+      if (days.length >= 2) out[d.id] = Math.min(28, days[Math.floor(days.length / 2)]);
+    }
+    return out;
   }
 
   function categorize(description, rules) {
@@ -1177,34 +1261,39 @@
       const avg = total / nMonths;
       if (avg < 10) continue;
       const perMonth = kept.length / nMonths;
+      const monthsSeen = new Set(kept.map((h) => h[0])).size;
       const amounts = kept.map((h) => h[1]);
       let action = g.action;
       if (!action) {
-        const steady = new Set(kept.map((h) => h[0])).size >= 2 && perMonth <= 1.5 &&
+        const steady = monthsSeen >= 2 && perMonth <= 1.5 &&
           Math.max(...amounts) - Math.min(...amounts) <= Math.max(2.0, (total / kept.length) * 0.25);
         // a steady monthly charge is only "cancel a subscription" advice when
         // it lives in a subscription-ish category — a same-priced monthly
         // Target run is a habit, not a membership
         if (steady && ["Subscriptions", "Entertainment", "Other"].includes(g.category)) {
           action = "cancel";
-        } else if (perMonth >= 4 || avg >= 40) {
+        } else if ((perMonth >= 4 || avg >= 40) && (monthsSeen >= 2 || kept.length >= 3)) {
+          // a repeated habit — a single large one-off (new tires, a repair)
+          // is NOT a habit to halve; it rolls into the tail
           action = "trim";
         } else {
-          continue; // small one-offs roll into the category tail
+          continue;
         }
       }
       const [fraction, necessity] = CUT_RULES[action];
       const cut = avg * fraction;
       const biggest = kept.slice().sort((a, b) => b[1] - a[1]).slice(0, 3);
+      const freqTxt = perMonth >= 0.75
+        ? `${Math.max(1, Math.round(perMonth))} charge(s)/mo`
+        : `${kept.length} charge(s) in ${nMonths} month(s)`;
       items.push({
         action, label: g.label, category: g.category,
         monthly_avg: r2(avg), suggested_cut: r2(cut),
         necessity,
         priority: cutPriority(cut, necessity, perMonth),
         per_month: Math.round(perMonth * 10) / 10,
-        months_seen: new Set(kept.map((h) => h[0])).size,
-        message: `$${Math.round(avg).toLocaleString("en-US")}/mo across ${Math.round(perMonth)} charge(s)/mo — ` +
-          CUT_WORDING[action],
+        months_seen: monthsSeen,
+        message: `$${Math.round(avg).toLocaleString("en-US")}/mo, ${freqTxt} — ` + CUT_WORDING[action],
         examples: biggest.map((h) => exampleLine(h[3], h[2], h[1])),
       });
     }
@@ -1220,7 +1309,9 @@
           .sort((a, b) => b.hits.reduce((s, h) => s + h[1], 0) - a.hits.reduce((s, h) => s + h[1], 0))
           .slice(0, 3);
         items.push({
-          action: "trim", label: `Other ${cat}`, category: cat,
+          action: "trim",
+          label: cat === "Other" ? "Misc one-offs" : `Other ${cat}`,
+          category: cat,
           monthly_avg: r2(rest), suggested_cut: r2(rest * fraction),
           necessity,
           priority: cutPriority(rest * fraction, necessity, null),
@@ -1596,19 +1687,65 @@
         return { found: Boolean(stub), stub };
       }
 
+      case "/api/paycheck/history": {
+        // bulk history import (from pay stub uploads): records income for
+        // pattern learning WITHOUT running allocation plans or touching balances
+        const existing = new Set(db.paychecks.map((p) => p.date + "|" + r2(p.amount)));
+        let added = 0;
+        const items = (body && body.items) || [];
+        for (const item of items) {
+          const amount = r2(Number(item.amount) || 0);
+          const date = String(item.date || "").slice(0, 10);
+          const key = date + "|" + amount;
+          if (amount <= 0 || date.length !== 10 || existing.has(key)) continue;
+          db.paychecks.push({ id: nextId(db), source: String(item.source || "Paycheck").slice(0, 40),
+            amount, date, plan: null });
+          existing.add(key);
+          added++;
+        }
+        save(db);
+        return { added, duplicates: items.length - added,
+          pattern: paycheckPattern(listPaychecks(db, 100000)) };
+      }
+
       case "/api/paycheck/delete":
         db.paychecks = db.paychecks.filter((p) => p.id !== Number(body.id));
         save(db);
         return { ok: true };
 
       case "/api/transactions/import": {
-        const rules = mergeRules(db.rules);
+        const debts = listDebts(db);
+        const rules = mergeRules(db.rules, debts);
         const [txns, note] = body.statement
           ? parseStatementText(body.statement, rules)
           : parseBankCsv(body.csv || "", rules);
         const added = addTransactions(db, txns);
+        // the statement reveals when debt payments actually post — use that
+        // to fill in due days still sitting at the default
+        const inferred = inferDebtDueDays(debts, listTransactions(db, 10000));
+        const dueNotes = [];
+        for (const d of debts) {
+          const day = inferred[d.id];
+          if (day && day !== 1 && d.due_day === 1) {
+            upsertDebt(db, Object.assign({}, d, { due_day: day }));
+            dueNotes.push(`${d.name}: due day set to day ${day} of the month (from your payment history)`);
+          }
+        }
         save(db);
-        return { parsed: txns.length, added, duplicates: txns.length - added, note };
+        return { parsed: txns.length, added, duplicates: txns.length - added, note,
+          due_day_updates: dueNotes };
+      }
+
+      case "/api/transactions/recategorize": {
+        const rules = mergeRules(db.rules, listDebts(db));
+        let changed = 0;
+        for (const t of db.transactions) {
+          let cat = categorize(t.description, rules);
+          if (t.amount > 0 && cat === "Other") cat = t.category; // keep deposit guesses
+          if (cat !== t.category) { t.category = cat; changed++; }
+        }
+        save(db);
+        return { changed };
       }
 
       case "/api/transactions/clear":

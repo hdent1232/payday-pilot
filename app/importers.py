@@ -43,7 +43,22 @@ DEFAULT_RULES = [
     ("cvs", "Health & Fitness"), ("walgreens", "Health & Fitness"),
     ("doctor", "Health & Fitness"), ("dental", "Health & Fitness"),
     ("geico", "Insurance"), ("progressive", "Insurance"), ("state farm", "Insurance"),
-    ("allstate", "Insurance"), ("insurance", "Insurance"),
+    ("allstate", "Insurance"), ("insurance", "Insurance"), ("root ins", "Insurance"),
+    ("lemonade", "Insurance"), ("usaa", "Insurance"), ("liberty mutual", "Insurance"),
+    ("farmers ins", "Insurance"), ("nationwide", "Insurance"), ("the general", "Insurance"),
+    ("gainsco", "Insurance"),
+    ("discount tire", "Car & Maintenance"), ("firestone", "Car & Maintenance"),
+    ("jiffy lube", "Car & Maintenance"), ("take 5", "Car & Maintenance"),
+    ("valvoline", "Car & Maintenance"), ("strickland", "Car & Maintenance"),
+    ("autozone", "Car & Maintenance"), ("o'reilly", "Car & Maintenance"),
+    ("oreilly", "Car & Maintenance"), ("advance auto", "Car & Maintenance"),
+    ("pep boys", "Car & Maintenance"), ("oil change", "Car & Maintenance"),
+    ("tire", "Car & Maintenance"), ("car wash", "Car & Maintenance"),
+    ("turbotax", "Taxes & Fees"), ("intuit", "Taxes & Fees"), ("h&r block", "Taxes & Fees"),
+    ("irs treas", "Taxes & Fees"), ("tax payment", "Taxes & Fees"),
+    ("hinge", "Subscriptions"), ("tinder", "Subscriptions"), ("bumble", "Subscriptions"),
+    ("chime", "Transfers"), ("varo", "Transfers"), ("apple cash", "Transfers"),
+    ("discover e-pay", "Debt Payment"), ("discover payment", "Debt Payment"),
     ("steam", "Entertainment"), ("playstation", "Entertainment"), ("xbox", "Entertainment"),
     ("cinema", "Entertainment"), ("theatre", "Entertainment"), ("ticketmaster", "Entertainment"),
     ("365 market", "Dining"), ("aramark", "Dining"), ("waffle house", "Dining"),
@@ -66,7 +81,31 @@ DISCRETIONARY = {"Dining", "Subscriptions", "Shopping", "Entertainment", "Other"
 # Recurring-but-essential categories that shouldn't be flagged as "likely
 # subscriptions" (rent recurs every month; that's not a subscription to cancel).
 ESSENTIAL_RECURRING = {"Housing", "Utilities", "Phone", "Insurance", "Groceries",
-                       "Gas & Fuel", "Debt Payment", "Transfers", "Income"}
+                       "Gas & Fuel", "Debt Payment", "Transfers", "Income",
+                       "Car & Maintenance", "Taxes & Fees"}
+
+# Words too generic to identify a debt by ("SERVICES" would match anything).
+_GENERIC_DEBT_WORDS = {"service", "services", "financia", "financial", "national",
+                       "credit", "america", "united", "collect", "collecti",
+                       "account", "payment", "bank"}
+
+
+def _debt_keywords(name):
+    return [w[:8].lower() for w in re.findall(r"[A-Za-z]{6,}", name or "")
+            if w[:8].lower() not in _GENERIC_DEBT_WORDS]
+
+
+def debt_payment_rules(debts):
+    """Payments toward tracked debts are Debt Payment, never cuttable spending.
+
+    Derived from the debts themselves, so a "DISCOVER E-PAYMENT" is recognized
+    the moment a Discover card is imported.
+    """
+    rules = []
+    for d in debts:
+        for kw in _debt_keywords(d.get("name")):
+            rules.append({"keyword": kw, "category": "Debt Payment"})
+    return rules
 
 
 def categorize(description, rules):
@@ -77,10 +116,30 @@ def categorize(description, rules):
     return "Other"
 
 
-def merge_rules(user_rules):
+def merge_rules(user_rules, debts=None):
     merged = [{"keyword": r["keyword"].lower(), "category": r["category"]} for r in user_rules]
+    if debts:
+        merged += debt_payment_rules(debts)
     merged += [{"keyword": k, "category": c} for k, c in DEFAULT_RULES]
     return merged
+
+
+def infer_debt_due_days(debts, transactions):
+    """Debt due days from the days their payments actually post.
+
+    Credit reports don't carry due days; the bank statement does — the median
+    day-of-month of the payments toward each debt.
+    """
+    out = {}
+    for d in debts:
+        kws = _debt_keywords(d.get("name"))
+        if not kws:
+            continue
+        days = sorted(int(t["date"][8:10]) for t in transactions
+                      if t["amount"] < 0 and any(k in t["description"].lower() for k in kws))
+        if len(days) >= 2:
+            out[d["id"]] = min(28, days[len(days) // 2])
+    return out
 
 
 # ------------------------------------------------------------ bank CSV import
@@ -926,31 +985,35 @@ def build_cut_plan(transactions, months=6):
         if avg < 10:
             continue
         per_month = len(hits) / n_months
+        months_seen = len({m for m, _, _, _ in hits})
         amounts = [a for _, a, _, _ in hits]
         action = g["action"]
         if not action:
-            steady = (len({m for m, _, _, _ in hits}) >= 2 and per_month <= 1.5
+            steady = (months_seen >= 2 and per_month <= 1.5
                       and max(amounts) - min(amounts) <= max(2.0, (total / len(hits)) * 0.25))
             # a steady monthly charge is only "cancel a subscription" advice
             # when it lives in a subscription-ish category — a same-priced
             # monthly Target run is a habit, not a membership
             if steady and g["category"] in ("Subscriptions", "Entertainment", "Other"):
                 action = "cancel"
-            elif per_month >= 4 or avg >= 40:
+            elif (per_month >= 4 or avg >= 40) and (months_seen >= 2 or len(hits) >= 3):
+                # a repeated habit — a single large one-off (new tires, a
+                # repair) is NOT a habit to halve; it rolls into the tail
                 action = "trim"
             else:
-                continue  # small one-offs roll into the category tail
+                continue
         fraction, necessity = _CUT_RULES[action]
         cut = avg * fraction
         biggest = sorted(hits, key=lambda h: -h[1])[:3]
+        freq_txt = (f"{max(1, round(per_month))} charge(s)/mo" if per_month >= 0.75
+                    else f"{len(hits)} charge(s) in {n_months} month(s)")
         items.append({
             "action": action, "label": g["label"], "category": g["category"],
             "monthly_avg": round(avg, 2), "suggested_cut": round(cut, 2),
             "necessity": necessity,
             "priority": _cut_priority(cut, necessity, per_month),
-            "per_month": round(per_month, 1), "months_seen": len({m for m, _, _, _ in hits}),
-            "message": f"${avg:,.0f}/mo across {per_month:.0f} charge(s)/mo — "
-                       + _CUT_WORDING[action],
+            "per_month": round(per_month, 1), "months_seen": months_seen,
+            "message": f"${avg:,.0f}/mo, {freq_txt} — " + _CUT_WORDING[action],
             "examples": [_example_line(d, desc, a) for _, a, desc, d in biggest],
         })
 
@@ -964,7 +1027,9 @@ def build_cut_plan(transactions, months=6):
                            if g["category"] == cat and not any(i["label"] == g["label"] for i in items)),
                           key=lambda g: -sum(a for _, a, _, _ in g["hits"]))[:3]
             items.append({
-                "action": "trim", "label": f"Other {cat}", "category": cat,
+                "action": "trim",
+                "label": "Misc one-offs" if cat == "Other" else f"Other {cat}",
+                "category": cat,
                 "monthly_avg": round(rest, 2), "suggested_cut": round(rest * fraction, 2),
                 "necessity": necessity,
                 "priority": _cut_priority(rest * fraction, necessity, None),

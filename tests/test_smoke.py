@@ -278,6 +278,25 @@ class SmokeTest(unittest.TestCase):
         for key in ("settings", "debts", "bills", "paychecks", "transactions", "rules"):
             self.assertIn(key, export)
 
+        # -- bulk paycheck history import: dedupe + learned pay pattern
+        hist = self.call("/api/paycheck/history", {"items": [
+            {"amount": 800, "date": "2026-05-01", "source": "Job"},
+            {"amount": 800, "date": "2026-05-15", "source": "Job"},
+            {"amount": 810, "date": "2026-05-29", "source": "Job"},
+            {"amount": 800, "date": "2026-06-12", "source": "Job"},
+            {"amount": 795, "date": "2026-06-26", "source": "Job"},
+            {"amount": 800, "date": "2026-05-01", "source": "Job"},  # dup in batch
+        ]})
+        self.assertEqual(hist["added"], 5)
+        self.assertEqual(hist["pattern"]["frequency"], "biweekly")
+        again_hist = self.call("/api/paycheck/history",
+                               {"items": [{"amount": 800, "date": "2026-05-01"}]})
+        self.assertEqual(again_hist["added"], 0)
+
+        # -- re-categorization picks up debt-derived rules on old data
+        recat = self.call("/api/transactions/recategorize", {})
+        self.assertIn("changed", recat)
+
         # -- importing a report again matches the debts we already track
         #    (consolidation instead of duplicates)
         self.call("/api/debts", report["debts"])
@@ -511,6 +530,73 @@ class PaystubTest(unittest.TestCase):
     def test_no_paycheck_found(self):
         from app.importers import parse_paystub_text
         self.assertIsNone(parse_paystub_text("A Summary of Your Rights Under the FCRA"))
+
+
+class CategorizationTest(unittest.TestCase):
+    def test_essentials_and_transfers_recognized(self):
+        from app.importers import categorize, merge_rules
+        rules = merge_rules([])
+        # a transfer to your own bank is not spending to cut
+        self.assertEqual(categorize("Chime chime.com CA AUTHID:455239", rules), "Transfers")
+        # car upkeep is essential, not shopping
+        self.assertEqual(categorize("POS9999 DISCOUNT TIRE ROUND ROCK", rules), "Car & Maintenance")
+        self.assertEqual(categorize("221- STRICKLAND BROTHE GEORGETOW", rules), "Car & Maintenance")
+        self.assertEqual(categorize("INTUIT *TURBOTAX CL.INTUIT.COM C", rules), "Taxes & Fees")
+        self.assertEqual(categorize("PP*GOOGLE HINGE 402-935-7733 CA", rules), "Subscriptions")
+        self.assertEqual(categorize("ROOT INS COLUMBUS OH", rules), "Insurance")
+
+    def test_debt_payments_recognized_from_tracked_debts(self):
+        from app.importers import categorize, merge_rules
+        debts = [{"name": "DISCOVERC"}, {"name": "UAS/COLLEGE AVE STUDEN"}]
+        rules = merge_rules([], debts)
+        self.assertEqual(categorize("DISCOVER E-PAYMENT 1223", rules), "Debt Payment")
+        self.assertEqual(categorize("COLLEGE AVE WEBPAY", rules), "Debt Payment")
+        # ordinary spending is untouched
+        self.assertEqual(categorize("KROGER #123", rules), "Groceries")
+
+    def test_due_day_inferred_from_payment_history(self):
+        from app.importers import infer_debt_due_days
+        debts = [{"id": 1, "name": "WESTLAKE FINANCIAL SVC"}, {"id": 2, "name": "DISCOVERC"}]
+        txns = [
+            {"date": "2026-04-07", "description": "WESTLAKE PAYMENT 888", "amount": -441},
+            {"date": "2026-05-08", "description": "WESTLAKE PAYMENT 888", "amount": -441},
+            {"date": "2026-06-07", "description": "WESTLAKE PAYMENT 888", "amount": -441},
+            {"date": "2026-06-11", "description": "DISCOVER E-PAYMENT", "amount": -35},
+        ]
+        inferred = infer_debt_due_days(debts, txns)
+        self.assertEqual(inferred[1], 7)          # median payment day
+        self.assertNotIn(2, inferred)             # one payment isn't a pattern
+
+    def test_one_time_purchase_is_not_a_habit(self):
+        from app.importers import build_cut_plan
+        txns = [
+            {"date": "2026-01-21", "description": "POS9999 BIG ELECTRONICS", "amount": -465.30,
+             "category": "Shopping"},
+            {"date": "2026-05-05", "description": "KROGER #1", "amount": -100.0, "category": "Groceries"},
+            {"date": "2026-06-05", "description": "KROGER #1", "amount": -100.0, "category": "Groceries"},
+        ]
+        plan = build_cut_plan(txns, 6)
+        # the one-off is never its own "go half as often" item; at most it
+        # rolls into the category tail
+        self.assertFalse(any("ELECTRONICS" in i["label"] for i in plan))
+        tail = next((i for i in plan if i["label"] == "Other Shopping"), None)
+        self.assertIsNotNone(tail)
+
+
+class PaycheckPatternTest(unittest.TestCase):
+    def test_pattern_learned_from_history(self):
+        from app.engine import paycheck_pattern
+        checks = [{"amount": 800, "date": f"2026-{m:02d}-{d:02d}"}
+                  for m, d in ((5, 1), (5, 15), (5, 29), (6, 12), (6, 26))]
+        p = paycheck_pattern(checks)
+        self.assertEqual(p["gap_days"], 14)
+        self.assertEqual(p["frequency"], "biweekly")
+        self.assertEqual(p["typical_amount"], 800)
+        self.assertEqual(p["next_payday"], "2026-07-10")
+
+    def test_needs_enough_history(self):
+        from app.engine import paycheck_pattern
+        self.assertIsNone(paycheck_pattern([{"amount": 800, "date": "2026-05-01"}]))
 
 
 class CutPlanTest(unittest.TestCase):
