@@ -794,11 +794,30 @@ CUT_BRANDS = (
     ("raising cane", "Raising Cane's", "trim"), ("sonic", "Sonic", "trim"),
 )
 
+# Necessity-weighted priority: each move gets a cut fraction (how much of the
+# spending to drop) and a necessity weight (0 = pure luxury, 1 = essential).
+# Ranking uses dollars-freed x (1 - necessity) x a small frequency boost, so a
+# $50 delivery habit outranks a $60 gas "optimization" — essentials are only
+# squeezed after everything easier.
+_CUT_RULES = {
+    "eliminate": (0.9, 0.05),   # convenience premium, cheap substitute exists
+    "cancel": (1.0, 0.10),      # subscriptions
+    "trim": (0.5, 0.35),        # habits: go half as often
+    "tail": (0.3, 0.50),        # category one-offs
+    "squeeze": (0.1, 0.85),     # essentials: last resort, small shave
+}
+SQUEEZE_CATS = ("Groceries", "Gas & Fuel", "Transport")
+
 _CUT_WORDING = {
     "cancel": "cancel it — a subscription you're paying every month",
-    "eliminate": "cut it out — pick up / cook / skip the in-app buys instead",
+    "eliminate": "cut 90% — pure convenience, a cheap substitute exists",
     "trim": "go half as often",
 }
+
+
+def _cut_priority(cut, necessity, per_month):
+    freq = 1 + min(per_month or 0, 12) / 24  # frequent habits are easier to shave
+    return round(cut * (1 - necessity) * freq, 2)
 
 
 def _example_line(date, desc, amount):
@@ -818,10 +837,16 @@ def build_cut_plan(transactions, months=6):
     month_set = set()
     groups = {}
     cat_spend = {}
+    squeeze = {}  # essential category -> {"total": $, "merchants": {label: $}}
     for t in transactions:
         if t["amount"] >= 0 or t["category"] not in DISCRETIONARY:
             if t["amount"] < 0 and t["category"] not in ("Transfers", "Debt Payment"):
                 month_set.add(t["date"][:7])
+                if t["category"] in SQUEEZE_CATS:
+                    s = squeeze.setdefault(t["category"], {"total": 0, "merchants": {}})
+                    label = re.sub(r"\s+", " ", t["description"]).strip()[:28]
+                    s["total"] -= t["amount"]
+                    s["merchants"][label] = s["merchants"].get(label, 0) - t["amount"]
             continue
         month = t["date"][:7]
         month_set.add(month)
@@ -860,11 +885,14 @@ def build_cut_plan(transactions, months=6):
                 action = "trim"
             else:
                 continue  # small one-offs roll into the category tail
-        cut = avg if action in ("cancel", "eliminate") else avg / 2
+        fraction, necessity = _CUT_RULES[action]
+        cut = avg * fraction
         biggest = sorted(hits, key=lambda h: -h[1])[:3]
         items.append({
             "action": action, "label": g["label"], "category": g["category"],
             "monthly_avg": round(avg, 2), "suggested_cut": round(cut, 2),
+            "necessity": necessity,
+            "priority": _cut_priority(cut, necessity, per_month),
             "per_month": round(per_month, 1), "months_seen": len({m for m, _, _, _ in hits}),
             "message": f"${avg:,.0f}/mo across {per_month:.0f} charge(s)/mo — "
                        + _CUT_WORDING[action],
@@ -876,17 +904,40 @@ def build_cut_plan(transactions, months=6):
         named = sum(i["monthly_avg"] for i in items if i["category"] == cat)
         rest = total / n_months - named
         if rest >= 30:
+            fraction, necessity = _CUT_RULES["tail"]
             tail = sorted((g for g in groups.values()
                            if g["category"] == cat and not any(i["label"] == g["label"] for i in items)),
                           key=lambda g: -sum(a for _, a, _, _ in g["hits"]))[:3]
             items.append({
                 "action": "trim", "label": f"Other {cat}", "category": cat,
-                "monthly_avg": round(rest, 2), "suggested_cut": round(rest * 0.3, 2),
+                "monthly_avg": round(rest, 2), "suggested_cut": round(rest * fraction, 2),
+                "necessity": necessity,
+                "priority": _cut_priority(rest * fraction, necessity, None),
                 "per_month": None, "months_seen": n_months,
                 "message": f"${rest:,.0f}/mo of one-offs — aim 30% lower",
                 "examples": [f"{g['label']} ${sum(a for _, a, _, _ in g['hits']) / n_months:,.0f}/mo"
                              for g in tail],
             })
 
-    items.sort(key=lambda i: -i["suggested_cut"])
-    return items[:8]
+    # essentials last: real money, but you need to eat and get to work, so
+    # only a small shave and always ranked after every discretionary cut
+    for cat, s in squeeze.items():
+        avg = s["total"] / n_months
+        fraction, necessity = _CUT_RULES["squeeze"]
+        cut = avg * fraction
+        if cut < 12:
+            continue
+        top = sorted(s["merchants"].items(), key=lambda kv: -kv[1])[:3]
+        items.append({
+            "action": "squeeze", "label": cat, "category": cat,
+            "monthly_avg": round(avg, 2), "suggested_cut": round(cut, 2),
+            "necessity": necessity,
+            "priority": _cut_priority(cut, necessity, None),
+            "per_month": None, "months_seen": n_months,
+            "message": f"${avg:,.0f}/mo — essential, so it's last in line; cheaper "
+                       f"brands or fewer trips could shave ~10%",
+            "examples": [f"{label} ${amt / n_months:,.0f}/mo" for label, amt in top],
+        })
+
+    items.sort(key=lambda i: -i["priority"])
+    return items[:10]

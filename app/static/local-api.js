@@ -1032,11 +1032,30 @@
     ["raising cane", "Raising Cane's", "trim"], ["sonic", "Sonic", "trim"],
   ];
 
+  // Necessity-weighted priority: each move gets a cut fraction (how much of
+  // the spending to drop) and a necessity weight (0 = pure luxury, 1 =
+  // essential). Ranking uses dollars-freed x (1 - necessity) x a small
+  // frequency boost, so a $50 delivery habit outranks a $60 gas
+  // "optimization" — essentials are only squeezed after everything easier.
+  const CUT_RULES = {
+    eliminate: [0.9, 0.05],  // convenience premium, cheap substitute exists
+    cancel: [1.0, 0.10],     // subscriptions
+    trim: [0.5, 0.35],       // habits: go half as often
+    tail: [0.3, 0.50],       // category one-offs
+    squeeze: [0.1, 0.85],    // essentials: last resort, small shave
+  };
+  const SQUEEZE_CATS = ["Groceries", "Gas & Fuel", "Transport"];
+
   const CUT_WORDING = {
     cancel: "cancel it — a subscription you're paying every month",
-    eliminate: "cut it out — pick up / cook / skip the in-app buys instead",
+    eliminate: "cut 90% — pure convenience, a cheap substitute exists",
     trim: "go half as often",
   };
+
+  function cutPriority(cut, necessity, perMonth) {
+    const freq = 1 + Math.min(perMonth || 0, 12) / 24; // frequent habits are easier to shave
+    return Math.round(cut * (1 - necessity) * freq * 100) / 100;
+  }
 
   function exampleLine(date, desc, amount) {
     const clean = desc.replace(/\s+/g, " ").trim().slice(0, 28);
@@ -1052,10 +1071,17 @@
     const monthSet = new Set();
     const groups = {};
     const catSpend = {};
+    const squeeze = {}; // essential category -> { total, merchants: { label: $ } }
     for (const t of transactions) {
       if (t.amount >= 0 || !DISCRETIONARY.has(t.category)) {
         if (t.amount < 0 && !["Transfers", "Debt Payment"].includes(t.category)) {
           monthSet.add(t.date.slice(0, 7));
+          if (SQUEEZE_CATS.includes(t.category)) {
+            const s = squeeze[t.category] = squeeze[t.category] || { total: 0, merchants: {} };
+            const label = t.description.replace(/\s+/g, " ").trim().slice(0, 28);
+            s.total -= t.amount;
+            s.merchants[label] = (s.merchants[label] || 0) - t.amount;
+          }
         }
         continue;
       }
@@ -1099,11 +1125,14 @@
           continue; // small one-offs roll into the category tail
         }
       }
-      const cut = action === "trim" ? avg / 2 : avg;
+      const [fraction, necessity] = CUT_RULES[action];
+      const cut = avg * fraction;
       const biggest = kept.slice().sort((a, b) => b[1] - a[1]).slice(0, 3);
       items.push({
         action, label: g.label, category: g.category,
         monthly_avg: r2(avg), suggested_cut: r2(cut),
+        necessity,
+        priority: cutPriority(cut, necessity, perMonth),
         per_month: Math.round(perMonth * 10) / 10,
         months_seen: new Set(kept.map((h) => h[0])).size,
         message: `$${Math.round(avg).toLocaleString("en-US")}/mo across ${Math.round(perMonth)} charge(s)/mo — ` +
@@ -1117,13 +1146,16 @@
       const named = items.filter((i) => i.category === cat).reduce((s, i) => s + i.monthly_avg, 0);
       const rest = total / nMonths - named;
       if (rest >= 30) {
+        const [fraction, necessity] = CUT_RULES.tail;
         const tail = Object.values(groups)
           .filter((g) => g.category === cat && !items.some((i) => i.label === g.label))
           .sort((a, b) => b.hits.reduce((s, h) => s + h[1], 0) - a.hits.reduce((s, h) => s + h[1], 0))
           .slice(0, 3);
         items.push({
           action: "trim", label: `Other ${cat}`, category: cat,
-          monthly_avg: r2(rest), suggested_cut: r2(rest * 0.3),
+          monthly_avg: r2(rest), suggested_cut: r2(rest * fraction),
+          necessity,
+          priority: cutPriority(rest * fraction, necessity, null),
           per_month: null, months_seen: nMonths,
           message: `$${Math.round(rest).toLocaleString("en-US")}/mo of one-offs — aim 30% lower`,
           examples: tail.map((g) =>
@@ -1132,8 +1164,28 @@
       }
     }
 
-    items.sort((a, b) => b.suggested_cut - a.suggested_cut);
-    return items.slice(0, 8);
+    // essentials last: real money, but you need to eat and get to work, so
+    // only a small shave and always ranked after every discretionary cut
+    for (const [cat, s] of Object.entries(squeeze)) {
+      const avg = s.total / nMonths;
+      const [fraction, necessity] = CUT_RULES.squeeze;
+      const cut = avg * fraction;
+      if (cut < 12) continue;
+      const top = Object.entries(s.merchants).sort((a, b) => b[1] - a[1]).slice(0, 3);
+      items.push({
+        action: "squeeze", label: cat, category: cat,
+        monthly_avg: r2(avg), suggested_cut: r2(cut),
+        necessity,
+        priority: cutPriority(cut, necessity, null),
+        per_month: null, months_seen: nMonths,
+        message: `$${Math.round(avg).toLocaleString("en-US")}/mo — essential, so it's last in line; ` +
+          "cheaper brands or fewer trips could shave ~10%",
+        examples: top.map(([label, amt]) => `${label} $${Math.round(amt / nMonths)}/mo`),
+      });
+    }
+
+    items.sort((a, b) => b.priority - a.priority);
+    return items.slice(0, 10);
   }
 
   function spendingSummary(transactions, months) {

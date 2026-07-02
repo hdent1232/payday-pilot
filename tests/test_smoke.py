@@ -490,11 +490,12 @@ class CutPlanTest(unittest.TestCase):
 
     def test_merchant_level_plan(self):
         from app.importers import build_cut_plan
-        plan = {i["label"]: i for i in build_cut_plan(self.make(), 6)}
-        # delivery apps: eliminate 100%, brands grouped across order names
+        items = build_cut_plan(self.make(), 6)
+        plan = {i["label"]: i for i in items}
+        # delivery apps: near-total cut (90%), brands grouped across order names
         dd = plan["DoorDash"]
         self.assertEqual(dd["action"], "eliminate")
-        self.assertAlmostEqual(dd["suggested_cut"], 158.40, places=2)
+        self.assertAlmostEqual(dd["suggested_cut"], 158.40 * 0.9, places=2)
         self.assertTrue(any("DOORDASH*PIZZA" in e and "$61.00" in e for e in dd["examples"]))
         # subscriptions: cancel the whole thing
         hulu = plan["Hulu"]
@@ -509,11 +510,25 @@ class CutPlanTest(unittest.TestCase):
         self.assertAlmostEqual(sbux["suggested_cut"], sbux["monthly_avg"] / 2, places=2)
         # a same-priced monthly Target run is NOT a subscription to cancel
         self.assertEqual(plan["TARGET 00021"]["action"], "trim")
-        # groceries are essential — never suggested
-        self.assertFalse(any("KROGER" in label for label in plan))
-        # biggest savings first
-        cuts = [i["suggested_cut"] for i in build_cut_plan(self.make(), 6)]
-        self.assertEqual(cuts, sorted(cuts, reverse=True))
+
+    def test_necessity_weighted_priority(self):
+        from app.importers import build_cut_plan
+        items = build_cut_plan(self.make(), 6)
+        # ranked by priority = dollars x (1 - necessity) x frequency boost
+        priorities = [i["priority"] for i in items]
+        self.assertEqual(priorities, sorted(priorities, reverse=True))
+        # pure-convenience delivery outranks everything
+        self.assertEqual(items[0]["label"], "DoorDash")
+        # groceries ARE suggested now, but only a 10% squeeze, ranked last
+        groc = next(i for i in items if i["label"] == "Groceries")
+        self.assertEqual(groc["action"], "squeeze")
+        self.assertEqual(groc["necessity"], 0.85)
+        self.assertAlmostEqual(groc["suggested_cut"], groc["monthly_avg"] * 0.1, places=2)
+        self.assertEqual(items[-1]["label"], "Groceries")
+        self.assertTrue(any("KROGER" in e for e in groc["examples"]))
+        # a luxury worth less per month still beats the bigger essential cut
+        self.assertLess(groc["priority"], plan_min := min(
+            i["priority"] for i in items if i["action"] != "squeeze"))
 
 
 class EngineTest(unittest.TestCase):

@@ -469,8 +469,9 @@ async function loadProjection() {
       : `Do all of these and you free <b>${money(p.advice.monthly_freed)}/mo</b> —
          debt-free in <b>${b.months} months</b> (${fmtDate(b.debt_free_date)})` +
         (active.stuck ? " instead of never." : `, paying ${money(b.total_interest)} total interest.`);
-    const tierNames = { cancel: "cancel subscriptions", eliminate: "cut out delivery & in-app buys", trim: "trim habits" };
-    const tiers = ["cancel", "eliminate", "trim"]
+    const tierNames = { eliminate: "cut out delivery & in-app buys (90%)", cancel: "cancel subscriptions",
+      trim: "trim habits & one-offs", squeeze: "squeeze essentials only if still short" };
+    const tiers = ["eliminate", "cancel", "trim", "squeeze"]
       .map((a) => ({ a, sum: p.advice.suggestions.filter((s) => s.action === a)
         .reduce((x, s) => x + s.suggested_cut, 0) }))
       .filter((t) => t.sum > 0);
@@ -492,7 +493,7 @@ async function loadProjection() {
 // One line per concrete money-saving move: named merchant, how often it's
 // hit, example charges, and what stopping it frees up.
 function cutItemsHTML(items) {
-  const badge = { cancel: "debt_min", eliminate: "debt_extra", trim: "fun" };
+  const badge = { cancel: "debt_min", eliminate: "debt_extra", trim: "fun", squeeze: "reserve" };
   return items.map((s) => `<div class="plan-item">
     <span class="badge ${badge[s.action] || "fun"}">${esc(s.action)}</span>
     <span><span class="what">${esc(s.label)}</span> — ${esc(s.message)}${
