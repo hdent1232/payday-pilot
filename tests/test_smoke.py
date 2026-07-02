@@ -293,9 +293,29 @@ class SmokeTest(unittest.TestCase):
                                {"items": [{"amount": 800, "date": "2026-05-01"}]})
         self.assertEqual(again_hist["added"], 0)
 
-        # -- re-categorization picks up debt-derived rules on old data
-        recat = self.call("/api/transactions/recategorize", {})
-        self.assertIn("changed", recat)
+        # -- stale categories fix THEMSELVES: a transaction stored under an
+        #    old wrong label is corrected automatically the next time any
+        #    screen loads — no button, no re-import
+        self.call("/api/transactions/import",
+                  {"csv": "Date,Description,Amount\n2026-06-20,Chime chime.com CA AUTHID:99,-250.00\n"})
+        import sqlite3 as _sq
+        from app import db as _db
+        conn = _db.connect()
+        conn.execute("UPDATE transactions SET category='Other', locked=0 "
+                     "WHERE description LIKE '%Chime%'")  # simulate old-version data
+        conn.commit()
+        conn.close()
+        state_txns = self.call("/api/spending?months=6")  # any screen load
+        txns = self.call("/api/transactions")["transactions"]
+        chime = next(t for t in txns if "Chime" in t["description"])
+        self.assertEqual(chime["category"], "Transfers")
+
+        # -- but a category the user set BY HAND is never overwritten
+        self.call("/api/transactions/category", {"id": chime["id"], "category": "Gifts"})
+        self.call("/api/spending?months=6")
+        chime = next(t for t in self.call("/api/transactions")["transactions"]
+                     if "Chime" in t["description"])
+        self.assertEqual(chime["category"], "Gifts")
 
         # -- importing a report again matches the debts we already track
         #    (consolidation instead of duplicates)

@@ -21,6 +21,29 @@ if getattr(sys, "frozen", False):  # PyInstaller bundle
 shutdown_event = threading.Event()
 
 
+def _auto_recategorize(conn):
+    """Re-apply current rules (built-in, user, and debt-derived) to every
+    transaction the user hasn't hand-categorized.
+
+    Runs before anything is computed, so categorization improvements and
+    newly imported debts correct existing data automatically — the user
+    never has to re-import or press anything.
+    """
+    debts = db.list_debts(conn)
+    rules = importers.merge_rules(db.list_rules(conn), debts)
+    changed = 0
+    for t in db.list_transactions(conn, limit=100000):
+        if t.get("locked"):
+            continue
+        cat = importers.categorize(t["description"], rules)
+        if t["amount"] > 0 and cat == "Other":
+            cat = t["category"]  # keep import-time deposit guesses
+        if cat != t["category"]:
+            db.update_transaction_category(conn, t["id"], cat, locked=False)
+            changed += 1
+    return changed
+
+
 def _paycheck_snapshot(conn):
     return {
         "bills": db.list_bills(conn),
@@ -128,6 +151,7 @@ class Handler(BaseHTTPRequestHandler):
         conn = db.connect()
         try:
             if route == "/api/state":
+                _auto_recategorize(conn)
                 settings = db.get_settings(conn)
                 debts = db.list_debts(conn)
                 bills = db.list_bills(conn)
@@ -141,6 +165,7 @@ class Handler(BaseHTTPRequestHandler):
                     "today": date.today().isoformat(),
                 })
             elif route == "/api/projection":
+                _auto_recategorize(conn)
                 settings = db.get_settings(conn)
                 debts = db.list_debts(conn)
                 bills = db.list_bills(conn)
@@ -187,6 +212,7 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/transactions":
                 self._json({"transactions": db.list_transactions(conn)})
             elif route == "/api/spending":
+                _auto_recategorize(conn)
                 months = int(query.get("months", ["6"])[0])
                 txns = db.list_transactions(conn, limit=10000)
                 settings = db.get_settings(conn)
@@ -330,17 +356,7 @@ class Handler(BaseHTTPRequestHandler):
                             "duplicates": len(txns) - added, "note": note,
                             "due_day_updates": due_notes})
             elif route == "/api/transactions/recategorize":
-                debts = db.list_debts(conn)
-                rules = importers.merge_rules(db.list_rules(conn), debts)
-                changed = 0
-                for t in db.list_transactions(conn, limit=100000):
-                    cat = importers.categorize(t["description"], rules)
-                    if t["amount"] > 0 and cat == "Other":
-                        cat = t["category"]  # keep existing guess for deposits
-                    if cat != t["category"]:
-                        db.update_transaction_category(conn, t["id"], cat)
-                        changed += 1
-                self._json({"changed": changed})
+                self._json({"changed": _auto_recategorize(conn)})
             elif route == "/api/transactions/clear":
                 db.delete_transactions(conn)
                 self._json({"ok": True})

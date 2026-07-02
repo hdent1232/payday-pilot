@@ -1641,6 +1641,24 @@
     try { return JSON.parse(settings.protected || "[]"); } catch (e) { return []; }
   }
 
+  // Re-apply current rules (built-in, user, and debt-derived) to every
+  // transaction the user hasn't hand-categorized. Runs before anything is
+  // computed, so categorization improvements and newly imported debts correct
+  // existing data automatically — the user never has to re-import or press
+  // anything.
+  function autoRecategorize(db) {
+    const rules = mergeRules(db.rules, listDebts(db));
+    let changed = 0;
+    for (const t of db.transactions) {
+      if (t.locked) continue;
+      let cat = categorize(t.description, rules);
+      if (t.amount > 0 && cat === "Other") cat = t.category; // keep deposit guesses
+      if (cat !== t.category) { t.category = cat; changed++; }
+    }
+    if (changed) save(db);
+    return changed;
+  }
+
   function handle(path, body) {
     const [route, queryStr] = path.split("?");
     const query = {};
@@ -1654,9 +1672,11 @@
 
     switch (route) {
       case "/api/state":
+        autoRecategorize(db);
         return stateResponse(db);
 
       case "/api/projection": {
+        autoRecategorize(db);
         const debts = listDebts(db);
         const txns = listTransactions(db, 10000);
         const budget = estimateMonthlyExtra(listBills(db), debts, settings, listPaychecks(db), txns);
@@ -1693,6 +1713,7 @@
         return { transactions: listTransactions(db) };
 
       case "/api/spending": {
+        autoRecategorize(db);
         const txns = listTransactions(db, 10000);
         const summary = spendingSummary(txns, Number(query.months) || 6, protectedList(settings));
         const debts = listDebts(db);
@@ -1852,17 +1873,8 @@
           due_day_updates: dueNotes };
       }
 
-      case "/api/transactions/recategorize": {
-        const rules = mergeRules(db.rules, listDebts(db));
-        let changed = 0;
-        for (const t of db.transactions) {
-          let cat = categorize(t.description, rules);
-          if (t.amount > 0 && cat === "Other") cat = t.category; // keep deposit guesses
-          if (cat !== t.category) { t.category = cat; changed++; }
-        }
-        save(db);
-        return { changed };
-      }
+      case "/api/transactions/recategorize":
+        return { changed: autoRecategorize(db) };
 
       case "/api/transactions/clear":
         db.transactions = [];
@@ -1871,7 +1883,9 @@
 
       case "/api/transactions/category": {
         const t = db.transactions.find((x) => x.id === Number(body.id));
-        if (t) t.category = body.category;
+        // a category the user chose by hand is locked: auto-recategorization
+        // must never overwrite their judgement
+        if (t) { t.category = body.category; t.locked = 1; }
         save(db);
         return { ok: true };
       }

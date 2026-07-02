@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS transactions(
     date        TEXT NOT NULL,
     description TEXT NOT NULL,
     amount      REAL NOT NULL,
-    category    TEXT NOT NULL DEFAULT ''
+    category    TEXT NOT NULL DEFAULT '',
+    locked      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS rules(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +97,11 @@ def connect():
     conn.executescript(SCHEMA)
     try:  # migration for databases created before account matching existed
         conn.execute("ALTER TABLE debts ADD COLUMN account_last4 TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:  # migration: manual category choices survive auto-recategorization
+        conn.execute("ALTER TABLE transactions ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -304,8 +310,11 @@ def add_transactions(conn, txns):
     return added
 
 
-def update_transaction_category(conn, txn_id, category):
-    conn.execute("UPDATE transactions SET category=? WHERE id=?", (category, txn_id))
+def update_transaction_category(conn, txn_id, category, locked=True):
+    # a category the user chose by hand is locked: auto-recategorization
+    # must never overwrite their judgement
+    conn.execute("UPDATE transactions SET category=?, locked=? WHERE id=?",
+                 (category, 1 if locked else 0, txn_id))
     conn.commit()
 
 
