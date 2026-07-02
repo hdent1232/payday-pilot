@@ -44,6 +44,8 @@ DEFAULT_RULES = [
     ("doctor", "Health & Fitness"), ("dental", "Health & Fitness"),
     ("geico", "Insurance"), ("progressive", "Insurance"), ("state farm", "Insurance"),
     ("allstate", "Insurance"), ("insurance", "Insurance"), ("root ins", "Insurance"),
+    ("prog ", "Insurance"), ("prog*", "Insurance"), ("prgrsv", "Insurance"),
+    ("ins prem", "Insurance"), ("ins premium", "Insurance"),
     ("lemonade", "Insurance"), ("usaa", "Insurance"), ("liberty mutual", "Insurance"),
     ("farmers ins", "Insurance"), ("nationwide", "Insurance"), ("the general", "Insurance"),
     ("gainsco", "Insurance"),
@@ -545,6 +547,7 @@ def _parse_screening_report(text):
         debts.append({
             "name": name[:60], "balance": balance, "apr": 0,
             "min_payment": _cr_money("Payment", block) or 0,
+            "past_due": _cr_money("Past Due", block) or 0,
             "term_months": None, "due_day": 1,
             "kind": _cr_kind(name, type_, industry),
             "account_last4": _account_last4(_cr_field("Account\\s*#", block)),
@@ -615,6 +618,7 @@ def _parse_bureau_report(text):
             "name": name[:60] + (" (collection)" if is_collection and "collection" not in name.lower() else ""),
             "balance": balance, "apr": 0,
             "min_payment": _tb_money_max("Monthly Payment Amount", block) or 0,
+            "past_due": _tb_money_max("Amount Past Due", block) or 0,
             "term_months": int(term.group(1)) if term and int(term.group(1)) > 1 else None,
             "due_day": 1, "kind": kind,
             "account_last4": _account_last4(acct.group(1) if acct else ""),
@@ -726,6 +730,7 @@ def _consolidate(debts):
             dup["apr_estimated"] = bool(d.get("apr_estimated"))
             dup["apr_derived"] = bool(d.get("apr_derived"))
         dup["balance"] = max(dup["balance"], d["balance"])
+        dup["past_due"] = max(dup.get("past_due") or 0, d.get("past_due") or 0)
         if len(_norm_debt_name(d["name"])) > len(_norm_debt_name(dup["name"])) and "collection" not in d["name"].lower():
             dup["name"] = d["name"]
     return merged
@@ -758,17 +763,41 @@ _STUB_NET_LABELS = ("net pay", "net check", "net amount", "take home", "total ne
                     "check amount", "direct deposit")
 _STUB_GROSS_LABELS = ("gross pay", "total gross", "gross earnings", "total earnings")
 _STUB_DATE_LABELS = ("pay date", "check date", "date paid", "deposit date",
-                     "payment date", "advice date", "period end")
+                     "payment date", "advice date", "period end", "pay period")
 _STUB_DATE_RE = r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Za-z]{3,9}\.? \d{1,2},? \d{4})"
 
 
 def _stub_amount(labels, text):
+    # same-line first: "Net Pay $1,719.68 $19,872.48" (current column, not YTD)
     for label in labels:
         for m in re.finditer(label + r"\W{0,20}?" + MONEY_RE, text, re.I):
             value = float(m.group(1).replace(",", ""))
             if value > 0:
                 return value
+    # boxed layouts (Rippling etc.) put the value on a later line with other
+    # columns interleaved — take the first $-amount within reach of the label
+    for label in labels:
+        for m in re.finditer(label, text, re.I):
+            w = re.search(r"\$\s?([\d,]+(?:\.\d{1,2})?)", text[m.end():m.end() + 120])
+            if w:
+                value = float(w.group(1).replace(",", ""))
+                if value > 0:
+                    return value
     return None
+
+
+def _stub_date(text):
+    for label in _STUB_DATE_LABELS:
+        for m in re.finditer(label, text, re.I):
+            window = text[m.end():m.end() + 450]
+            dates = re.findall(_STUB_DATE_RE, window)
+            # "pay period: 12/21 - 12/27" -> the period END is the payday side
+            pick = dates[-1] if label == "pay period" and dates else (dates[0] if dates else None)
+            if pick:
+                parsed = _parse_date(pick.replace(".", ""))
+                if parsed:
+                    return parsed
+    return ""
 
 
 def parse_paystub_text(text):
@@ -783,19 +812,13 @@ def parse_paystub_text(text):
     amount = net or gross
     if not amount:
         return None
-    date = ""
-    for label in _STUB_DATE_LABELS:
-        m = re.search(label + r"\W{0,20}?" + _STUB_DATE_RE, text, re.I)
-        if m:
-            parsed = _parse_date(m.group(1).replace(".", ""))
-            if parsed:
-                date = parsed
-                break
+    date = _stub_date(text)
     source = ""
     for line in text.splitlines():
+        line = re.sub(r"earnings statement|pay ?stub|payroll advice|advice of deposit|statement of",
+                      "", line, flags=re.I)
         line = re.sub(r"\s+", " ", line).strip()
-        if len(re.sub(r"[^A-Za-z]", "", line)) >= 3 and not re.search(
-                r"earnings statement|pay ?stub|payroll advice|statement of", line, re.I):
+        if len(re.sub(r"[^A-Za-z]", "", line)) >= 3:
             source = line[:32]
             break
     return {"amount": round(amount, 2), "net": net is not None, "date": date,
@@ -804,7 +827,7 @@ def parse_paystub_text(text):
 
 # ------------------------------------------------------------ spending analysis
 
-def spending_summary(transactions, months=6):
+def spending_summary(transactions, months=6, protected=None):
     """Monthly totals per category, recurring-charge detection and cut suggestions."""
     by_month = {}
     income_by_month = {}
@@ -857,7 +880,7 @@ def spending_summary(transactions, months=6):
                 })
     recurring.sort(key=lambda r: -r["monthly_avg"])
 
-    suggestions = build_cut_plan(transactions, months)
+    suggestions = build_cut_plan(transactions, months, protected)
 
     return {
         "months": month_keys,
@@ -914,18 +937,21 @@ CUT_BRANDS = (
 # $50 delivery habit outranks a $60 gas "optimization" — essentials are only
 # squeezed after everything easier.
 _CUT_RULES = {
-    "eliminate": (0.9, 0.05),   # convenience premium, cheap substitute exists
+    "eliminate": (1.0, 0.05),   # pure convenience premium — cut it entirely
     "cancel": (1.0, 0.10),      # subscriptions
     "trim": (0.5, 0.35),        # habits: go half as often
     "tail": (0.3, 0.50),        # category one-offs
     "squeeze": (0.1, 0.85),     # essentials: last resort, small shave
+    "review": (0.0, 0.60),      # unidentified recurring charge: never counted as savings
 }
 SQUEEZE_CATS = ("Groceries", "Gas & Fuel", "Transport")
 
 _CUT_WORDING = {
     "cancel": "cancel it — a subscription you're paying every month",
-    "eliminate": "cut 90% — pure convenience, a cheap substitute exists",
+    "eliminate": "cut it entirely — pure convenience, the substitute is free or already budgeted",
     "trim": "go half as often",
+    "review": "recurring charge the app can't identify — if it's a bill (insurance, rent), "
+              "press Keep so it's never counted as cuttable; if it's an unwanted subscription, cancel it",
 }
 
 
@@ -939,15 +965,18 @@ def _example_line(date, desc, amount):
     return f"{date[5:]} {clean} ${amount:,.2f}"
 
 
-def build_cut_plan(transactions, months=6):
+def build_cut_plan(transactions, months=6, protected=None):
     """Concrete, merchant-level plan for freeing money for debt.
 
     Instead of "cut the category in half": names the actual merchants with
     monthly amounts, how often they're hit, and example charges. Tiers the
     moves by pain: cancel subscriptions (painless), eliminate delivery/in-app
     convenience spending (cheap substitute exists), halve habits, then trim
-    what's left of each category.
+    what's left of each category. Anything the user marked "keep" (the
+    `protected` labels) is excluded from the plan AND from the freed-money
+    math — the app never budgets savings the user said they can't make.
     """
+    protected = {p.lower() for p in (protected or [])}
     month_set = set()
     groups = {}
     cat_spend = {}
@@ -975,6 +1004,14 @@ def build_cut_plan(transactions, months=6):
         g["hits"].append((month, -t["amount"], t["description"], t["date"]))
         cat_spend[t["category"]] = cat_spend.get(t["category"], 0) - t["amount"]
 
+    # drop protected merchants entirely (and their spend from category tails)
+    for key in list(groups):
+        g = groups[key]
+        if g["label"].lower() in protected:
+            cat_spend[g["category"]] = cat_spend.get(g["category"], 0) - sum(
+                a for _, a, _, _ in g["hits"])
+            del groups[key]
+
     month_keys = sorted(month_set)[-months:]
     n_months = max(1, len(month_keys))
     items = []
@@ -992,10 +1029,13 @@ def build_cut_plan(transactions, months=6):
             steady = (months_seen >= 2 and per_month <= 1.5
                       and max(amounts) - min(amounts) <= max(2.0, (total / len(hits)) * 0.25))
             # a steady monthly charge is only "cancel a subscription" advice
-            # when it lives in a subscription-ish category — a same-priced
-            # monthly Target run is a habit, not a membership
-            if steady and g["category"] in ("Subscriptions", "Entertainment", "Other"):
+            # when it's actually categorized as one — an unrecognized steady
+            # charge could be insurance or rent; never tell someone to cancel
+            # a bill the law or their lease requires
+            if steady and g["category"] == "Subscriptions":
                 action = "cancel"
+            elif steady:
+                action = "review"  # could be insurance or rent — ask, don't advise
             elif (per_month >= 4 or avg >= 40) and (months_seen >= 2 or len(hits) >= 3):
                 # a repeated habit — a single large one-off (new tires, a
                 # repair) is NOT a habit to halve; it rolls into the tail
@@ -1042,6 +1082,8 @@ def build_cut_plan(transactions, months=6):
     # essentials last: real money, but you need to eat and get to work, so
     # only a small shave and always ranked after every discretionary cut
     for cat, s in squeeze.items():
+        if cat.lower() in protected:
+            continue
         avg = s["total"] / n_months
         fraction, necessity = _CUT_RULES["squeeze"]
         cut = avg * fraction
@@ -1059,5 +1101,6 @@ def build_cut_plan(transactions, months=6):
             "examples": [f"{label} ${amt / n_months:,.0f}/mo" for label, amt in top],
         })
 
+    items = [i for i in items if i["label"].lower() not in protected]
     items.sort(key=lambda i: -i["priority"])
     return items[:10]

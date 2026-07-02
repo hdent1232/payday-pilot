@@ -583,6 +583,86 @@ class CategorizationTest(unittest.TestCase):
         self.assertIsNotNone(tail)
 
 
+# Rippling-style stub: labels in a boxed right column, values on LATER lines
+# with unrelated left-column text interleaved between label and value.
+RIPPLING_STUB = """EARNINGS STATEMENT
+FINDLAY MACHINE & TOOL LLC                       ADVICE OF DEPOSIT
+(Legal Address)
+411 S Main St.
+Findlay, OH 45840                                PAY PERIOD:
+Phone: +14196494373                              12/21/2025 - 12/27/2025
+211 Tasus Way
+Georgetown, TX 78626                             PAY DATE:
+Phone: +14196494373
+
+
+                                                 01/02/2026
+
+                                                 GROSS PAY:
+PAID TO:                                         $1,608.98
+Jaden Example
+                                                 NET PAY:
+                                                 $1,261.78
+
+SUMMARY            CURRENT        YTD
+Gross Pay          $1,608.98      $1,608.98
+Net Pay            $1,261.78      $1,263.02
+"""
+
+
+class PaystubBoxedLayoutTest(unittest.TestCase):
+    def test_rippling_layout(self):
+        from app.importers import parse_paystub_text
+        stub = parse_paystub_text(RIPPLING_STUB)
+        self.assertEqual(stub["amount"], 1261.78)   # net, current — not YTD, not gross
+        self.assertTrue(stub["net"])
+        self.assertEqual(stub["date"], "2026-01-02")  # pay date, not the period dates
+        self.assertIn("FINDLAY", stub["source"])
+
+
+class AllocatorPriorityTest(unittest.TestCase):
+    SETTINGS = {"pay_frequency": "biweekly", "strategy": "avalanche",
+                "emergency_target": "0", "emergency_balance": "0", "emergency_pct": "20",
+                "fun_pct": "0", "variable_budget": "0", "monthly_net_income": "0"}
+
+    def test_catch_up_comes_first(self):
+        from datetime import date
+        from app.engine import build_plan
+        debts = [{"id": 1, "name": "Westlake", "balance": 9000, "apr": 25.0,
+                  "min_payment": 441, "due_day": 20, "past_due": 882}]
+        plan = build_plan(1000, date(2026, 7, 2), [], debts, self.SETTINGS)
+        self.assertEqual(plan["items"][0]["kind"], "catchup")
+        self.assertEqual(plan["items"][0]["amount"], 882)
+        self.assertEqual(plan["totals"]["catch_up"], 882)
+
+    def test_goal_funded_by_date(self):
+        from datetime import date
+        from app.engine import build_plan
+        goals = [{"id": 5, "name": "Anniversary gift", "amount": 300, "saved": 0,
+                  "due_date": "2026-08-27"}]
+        plan = build_plan(1000, date(2026, 7, 2), [], [], self.SETTINGS, goals)
+        goal_items = [i for i in plan["items"] if i["kind"] == "goal"]
+        self.assertEqual(len(goal_items), 1)
+        # ~5 biweekly checks until 8/27 -> $60/check
+        self.assertAlmostEqual(goal_items[0]["amount"], 60.0, delta=16)
+        self.assertAlmostEqual(plan["goal_updates"][5], goal_items[0]["amount"], places=2)
+
+
+class ProtectedTest(unittest.TestCase):
+    def test_kept_merchants_never_suggested_or_counted(self):
+        from app.importers import build_cut_plan
+        txns = []
+        for m in ("2026-05", "2026-06"):
+            txns.append({"date": f"{m}-04", "description": "DOORDASH*TACOS", "amount": -80.0, "category": "Dining"})
+            txns.append({"date": f"{m}-02", "description": "NETFLIX.COM", "amount": -22.99, "category": "Subscriptions"})
+        base = build_cut_plan(txns, 6)
+        self.assertTrue(any(i["label"] == "DoorDash" for i in base))
+        kept = build_cut_plan(txns, 6, ["DoorDash"])
+        self.assertFalse(any(i["label"] == "DoorDash" for i in kept))
+        # and its dollars don't leak back in through the category tail
+        self.assertFalse(any(i["category"] == "Dining" and i["suggested_cut"] > 0 for i in kept))
+
+
 class PaycheckPatternTest(unittest.TestCase):
     def test_pattern_learned_from_history(self):
         from app.engine import paycheck_pattern
@@ -625,10 +705,10 @@ class CutPlanTest(unittest.TestCase):
         from app.importers import build_cut_plan
         items = build_cut_plan(self.make(), 6)
         plan = {i["label"]: i for i in items}
-        # delivery apps: near-total cut (90%), brands grouped across order names
+        # delivery apps: cut entirely, brands grouped across order names
         dd = plan["DoorDash"]
         self.assertEqual(dd["action"], "eliminate")
-        self.assertAlmostEqual(dd["suggested_cut"], 158.40 * 0.9, places=2)
+        self.assertAlmostEqual(dd["suggested_cut"], 158.40, places=2)
         self.assertTrue(any("DOORDASH*PIZZA" in e and "$61.00" in e for e in dd["examples"]))
         # subscriptions: cancel the whole thing
         hulu = plan["Hulu"]
@@ -641,8 +721,11 @@ class CutPlanTest(unittest.TestCase):
         sbux = plan["Starbucks"]
         self.assertEqual(sbux["action"], "trim")
         self.assertAlmostEqual(sbux["suggested_cut"], sbux["monthly_avg"] / 2, places=2)
-        # a same-priced monthly Target run is NOT a subscription to cancel
-        self.assertEqual(plan["TARGET 00021"]["action"], "trim")
+        # a same-priced monthly charge outside Subscriptions could be
+        # insurance or rent — flag it for the user, never "cancel" it and
+        # never count it as savings
+        self.assertEqual(plan["TARGET 00021"]["action"], "review")
+        self.assertEqual(plan["TARGET 00021"]["suggested_cut"], 0)
 
     def test_necessity_weighted_priority(self):
         from app.importers import build_cut_plan
@@ -657,11 +740,13 @@ class CutPlanTest(unittest.TestCase):
         self.assertEqual(groc["action"], "squeeze")
         self.assertEqual(groc["necessity"], 0.85)
         self.assertAlmostEqual(groc["suggested_cut"], groc["monthly_avg"] * 0.1, places=2)
-        self.assertEqual(items[-1]["label"], "Groceries")
+        real_cuts = [i for i in items if i["suggested_cut"] > 0]
+        self.assertEqual(real_cuts[-1]["label"], "Groceries")  # last actual cut
         self.assertTrue(any("KROGER" in e for e in groc["examples"]))
         # a luxury worth less per month still beats the bigger essential cut
-        self.assertLess(groc["priority"], plan_min := min(
-            i["priority"] for i in items if i["action"] != "squeeze"))
+        self.assertLess(groc["priority"], min(
+            i["priority"] for i in items
+            if i["action"] != "squeeze" and i["suggested_cut"] > 0))
 
 
 class EngineTest(unittest.TestCase):

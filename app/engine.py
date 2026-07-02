@@ -52,7 +52,7 @@ def pick_target_debt(debts, strategy):
     return max(active, key=lambda d: (d["apr"], d["balance"]))
 
 
-def build_plan(amount, pay_date, bills, debts, settings):
+def build_plan(amount, pay_date, bills, debts, settings, goals=None):
     """Return an allocation plan: exactly where every dollar of this paycheck goes.
 
     Also returns per-bill reserve updates so bill sinking funds carry over
@@ -67,9 +67,18 @@ def build_plan(amount, pay_date, bills, debts, settings):
     items = []
     warnings = []
     reserve_updates = {}  # bill_id -> new reserved amount
+    goal_updates = {}     # goal_id -> new saved amount
 
-    # ---- 1. obligations: bills + debt minimums, earliest due first -------
+    # ---- 1. obligations, earliest due first: past-due catch-ups (due NOW,
+    # before everything), bills, debt minimums, and purchase goals ---------
     obligations = []
+    for d in debts:
+        past_due = min(float(d.get("past_due") or 0), d["balance"])
+        if past_due > 0.01:
+            obligations.append({
+                "kind": "debt_catchup", "ref": d, "due": pay_date,
+                "share": round(past_due, 2), "due_now": True,
+            })
     for b in bills:
         due = next_due_date(b["due_day"], pay_date)
         needed = max(0.0, b["amount"] - b["reserved"])
@@ -88,6 +97,17 @@ def build_plan(amount, pay_date, bills, debts, settings):
         share = payment if due < window_end else round(payment / n, 2)
         obligations.append({
             "kind": "debt_min", "ref": d, "due": due, "share": share,
+            "due_now": due < window_end,
+        })
+    for g in (goals or []):
+        needed = max(0.0, g["amount"] - g["saved"])
+        due = parse_date(g["due_date"]) if g.get("due_date") else None
+        if needed <= 0.01 or not due or due < pay_date:
+            continue
+        n = checks_until(due, pay_date, freq)
+        share = needed if due < window_end else round(needed / n, 2)
+        obligations.append({
+            "kind": "goal", "ref": g, "due": due, "share": share,
             "due_now": due < window_end,
         })
     obligations.sort(key=lambda o: (o["due"], -o["share"]))
@@ -126,6 +146,27 @@ def build_plan(amount, pay_date, bills, debts, settings):
                         "note": f"${reserve_updates[ref['id']]:.2f} of ${ref['amount']:.2f} "
                                 f"saved for the {ob['due'].isoformat()} bill",
                     })
+        elif ob["kind"] == "debt_catchup":
+            if alloc >= 0.01:
+                items.append({
+                    "action": f"CATCH UP {ref['name']}", "amount": alloc,
+                    "from_paycheck": alloc, "kind": "catchup", "category": "Debt",
+                    "due": ob["due"].isoformat(),
+                    "note": f"${ob['share']:.2f} past due — paid before everything else",
+                    "debt_id": ref["id"],
+                })
+        elif ob["kind"] == "goal":
+            new_saved = round(ref["saved"] + alloc, 2)
+            goal_updates[ref["id"]] = new_saved
+            if alloc >= 0.01:
+                items.append({
+                    "action": f"Set aside for {ref['name']}", "amount": alloc,
+                    "from_paycheck": alloc, "kind": "goal", "category": "Goals",
+                    "due": ob["due"].isoformat(),
+                    "note": f"${new_saved:.2f} of ${ref['amount']:.2f} saved — "
+                            f"needed by {ob['due'].isoformat()}",
+                    "goal_id": ref["id"],
+                })
         else:  # debt minimum
             if alloc >= 0.01:
                 verb = "Pay" if ob["due_now"] else "Set aside for"
@@ -217,6 +258,8 @@ def build_plan(amount, pay_date, bills, debts, settings):
         "totals": {
             "bills": round(sum(i["from_paycheck"] for i in items if i["kind"] in ("bill", "reserve")), 2),
             "debt_min": round(sum(i["from_paycheck"] for i in items if i["kind"] == "debt_min"), 2),
+            "catch_up": round(sum(i["from_paycheck"] for i in items if i["kind"] == "catchup"), 2),
+            "goals": round(sum(i["from_paycheck"] for i in items if i["kind"] == "goal"), 2),
             "debt_extra": extra,
             "essentials": round(sum(i["from_paycheck"] for i in items if i["kind"] == "essentials"), 2),
             "emergency": emergency_alloc,
@@ -226,6 +269,7 @@ def build_plan(amount, pay_date, bills, debts, settings):
             "unallocated": round(float(amount) - total_allocated, 2),
         },
         "reserve_updates": reserve_updates,
+        "goal_updates": goal_updates,
         "target_debt": target_debt["name"] if target_debt else None,
         "strategy": strategy,
     }

@@ -21,6 +21,7 @@ DEFAULT_SETTINGS = {
     "monthly_net_income": "0",     # 0 = estimate from recent paychecks
     "bank_balance": "",            # live checking balance, user-updated
     "bank_balance_updated": "",    # ISO date of the last balance update
+    "protected": "[]",             # JSON list of merchants the user marked "keep"
 }
 
 SCHEMA = """
@@ -39,7 +40,16 @@ CREATE TABLE IF NOT EXISTS debts(
     due_day     INTEGER NOT NULL DEFAULT 1,
     notes       TEXT NOT NULL DEFAULT '',
     account_last4 TEXT NOT NULL DEFAULT '',
-    apr_estimated INTEGER NOT NULL DEFAULT 0
+    apr_estimated INTEGER NOT NULL DEFAULT 0,
+    past_due    REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS goals(
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name     TEXT NOT NULL,
+    amount   REAL NOT NULL DEFAULT 0,
+    saved    REAL NOT NULL DEFAULT 0,
+    due_date TEXT NOT NULL,
+    notes    TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS bills(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +96,11 @@ def connect():
     conn.executescript(SCHEMA)
     try:  # migration for databases created before account matching existed
         conn.execute("ALTER TABLE debts ADD COLUMN account_last4 TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:  # migration: catch-up support for accounts behind on payments
+        conn.execute("ALTER TABLE debts ADD COLUMN past_due REAL NOT NULL DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -145,19 +160,54 @@ def upsert_debt(conn, d):
         "notes": d.get("notes") or "",
         "account_last4": d.get("account_last4") or "",
         "apr_estimated": 1 if d.get("apr_estimated") else 0,
+        "past_due": max(0.0, float(d.get("past_due") or 0)),
     }
     if d.get("id"):
         conn.execute(
             "UPDATE debts SET name=?, kind=?, balance=?, apr=?, min_payment=?, "
-            "term_months=?, due_day=?, notes=?, account_last4=?, apr_estimated=? WHERE id=?",
+            "term_months=?, due_day=?, notes=?, account_last4=?, apr_estimated=?, past_due=? "
+            "WHERE id=?",
             (*fields.values(), d["id"]),
         )
     else:
         conn.execute(
             "INSERT INTO debts(name, kind, balance, apr, min_payment, term_months, due_day, "
-            "notes, account_last4, apr_estimated) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "notes, account_last4, apr_estimated, past_due) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             tuple(fields.values()),
         )
+    conn.commit()
+
+
+# ---------------------------------------------------------------- goals
+
+def list_goals(conn):
+    return rows_to_dicts(conn.execute("SELECT * FROM goals ORDER BY due_date, name"))
+
+
+def upsert_goal(conn, g):
+    fields = {
+        "name": (g.get("name") or "Goal").strip(),
+        "amount": max(0.0, float(g.get("amount") or 0)),
+        "saved": max(0.0, float(g.get("saved") or 0)),
+        "due_date": str(g.get("due_date") or "")[:10],
+        "notes": g.get("notes") or "",
+    }
+    if g.get("id"):
+        conn.execute("UPDATE goals SET name=?, amount=?, saved=?, due_date=?, notes=? WHERE id=?",
+                     (*fields.values(), g["id"]))
+    else:
+        conn.execute("INSERT INTO goals(name, amount, saved, due_date, notes) VALUES(?, ?, ?, ?, ?)",
+                     tuple(fields.values()))
+    conn.commit()
+
+
+def delete_goal(conn, goal_id):
+    conn.execute("DELETE FROM goals WHERE id=?", (goal_id,))
+    conn.commit()
+
+
+def set_goal_saved(conn, goal_id, saved):
+    conn.execute("UPDATE goals SET saved=? WHERE id=?", (round(saved, 2), goal_id))
     conn.commit()
 
 

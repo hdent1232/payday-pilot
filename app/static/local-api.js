@@ -25,6 +25,7 @@
     monthly_net_income: "0",
     bank_balance: "",
     bank_balance_updated: "",
+    protected: "[]",
   };
 
   function load() {
@@ -32,6 +33,7 @@
       const raw = localStorage.getItem(STORE_KEY);
       if (raw) {
         const db = JSON.parse(raw);
+        db.goals = db.goals || [];
         // migration: mark previously imported type-default APRs as estimates
         for (const d of db.debts || []) {
           if (d.apr_estimated === undefined) {
@@ -41,7 +43,7 @@
         return db;
       }
     } catch (e) { /* corrupted store: start fresh */ }
-    return { settings: {}, debts: [], bills: [], paychecks: [], transactions: [], rules: [], seq: 1 };
+    return { settings: {}, debts: [], bills: [], paychecks: [], transactions: [], rules: [], goals: [], seq: 1 };
   }
 
   function save(db) {
@@ -124,7 +126,7 @@
       (b.apr > a.apr || (b.apr === a.apr && b.balance > a.balance)) ? b : a);
   }
 
-  function buildPlan(amount, payDate, bills, debts, settings) {
+  function buildPlan(amount, payDate, bills, debts, settings, goals) {
     const freq = settings.pay_frequency;
     const strategy = settings.strategy;
     const period = PERIOD_DAYS[freq];
@@ -134,8 +136,16 @@
     const items = [];
     const warnings = [];
     const reserveUpdates = {};
+    const goalUpdates = {};
 
     const obligations = [];
+    // past-due catch-ups: due NOW, before everything
+    for (const d of debts) {
+      const pastDue = Math.min(Number(d.past_due) || 0, d.balance);
+      if (pastDue > 0.01) {
+        obligations.push({ kind: "debt_catchup", ref: d, due: payDate, share: r2(pastDue), dueNow: true });
+      }
+    }
     for (const b of bills) {
       const due = nextDueDate(b.due_day, payDate);
       const needed = Math.max(0, b.amount - b.reserved);
@@ -150,6 +160,14 @@
       const n = checksUntil(due, payDate, freq);
       const dueNow = due < windowEnd;
       obligations.push({ kind: "debt_min", ref: d, due, share: dueNow ? payment : r2(payment / n), dueNow });
+    }
+    for (const g of goals || []) {
+      const needed = Math.max(0, g.amount - g.saved);
+      const due = (g.due_date || "").slice(0, 10);
+      if (needed <= 0.01 || !due || due < payDate) continue;
+      const n = checksUntil(due, payDate, freq);
+      const dueNow = due < windowEnd;
+      obligations.push({ kind: "goal", ref: g, due, share: dueNow ? needed : r2(needed / n), dueNow });
     }
     obligations.sort((a, b) => (a.due < b.due ? -1 : a.due > b.due ? 1 : b.share - a.share));
 
@@ -178,6 +196,21 @@
               note: `$${reserveUpdates[ref.id].toFixed(2)} of $${ref.amount.toFixed(2)} ` +
                     `saved for the ${ob.due} bill` });
           }
+        }
+      } else if (ob.kind === "debt_catchup") {
+        if (alloc >= 0.01) {
+          items.push({ action: `CATCH UP ${ref.name}`, amount: alloc, from_paycheck: alloc,
+            kind: "catchup", category: "Debt", due: ob.due,
+            note: `$${ob.share.toFixed(2)} past due — paid before everything else`, debt_id: ref.id });
+        }
+      } else if (ob.kind === "goal") {
+        const newSaved = r2(ref.saved + alloc);
+        goalUpdates[ref.id] = newSaved;
+        if (alloc >= 0.01) {
+          items.push({ action: `Set aside for ${ref.name}`, amount: alloc, from_paycheck: alloc,
+            kind: "goal", category: "Goals", due: ob.due,
+            note: `$${newSaved.toFixed(2)} of $${ref.amount.toFixed(2)} saved — needed by ${ob.due}`,
+            goal_id: ref.id });
         }
       } else if (alloc >= 0.01) {
         const verb = ob.dueNow ? "Pay" : "Set aside for";
@@ -264,6 +297,8 @@
       totals: {
         bills: sum(["bill", "reserve"]),
         debt_min: sum(["debt_min"]),
+        catch_up: sum(["catchup"]),
+        goals: sum(["goal"]),
         debt_extra: extra,
         essentials: sum(["essentials"]),
         emergency: emergencyAlloc,
@@ -273,6 +308,7 @@
         unallocated: r2(amount - totalAllocated),
       },
       reserve_updates: reserveUpdates,
+      goal_updates: goalUpdates,
       target_debt: targetDebt ? targetDebt.name : null,
       strategy,
     };
@@ -457,6 +493,8 @@
     ["doctor", "Health & Fitness"], ["dental", "Health & Fitness"],
     ["geico", "Insurance"], ["progressive", "Insurance"], ["state farm", "Insurance"],
     ["allstate", "Insurance"], ["insurance", "Insurance"], ["root ins", "Insurance"],
+    ["prog ", "Insurance"], ["prog*", "Insurance"], ["prgrsv", "Insurance"],
+    ["ins prem", "Insurance"], ["ins premium", "Insurance"],
     ["lemonade", "Insurance"], ["usaa", "Insurance"], ["liberty mutual", "Insurance"],
     ["farmers ins", "Insurance"], ["nationwide", "Insurance"], ["the general", "Insurance"],
     ["gainsco", "Insurance"],
@@ -895,6 +933,7 @@
       debts.push({
         name: name.slice(0, 60), balance, apr: 0,
         min_payment: crMoney("Payment", block) || 0,
+        past_due: crMoney("Past Due", block) || 0,
         term_months: null, due_day: 1,
         kind: crKind(name, crField("Type", block), crField("Industry", block)),
         account_last4: accountLast4(crField("Account\\s*#", block)),
@@ -967,6 +1006,7 @@
         name: name.slice(0, 60) + (isCollection && !name.toLowerCase().includes("collection") ? " (collection)" : ""),
         balance, apr: 0,
         min_payment: tbMoneyMax("Monthly Payment Amount", block) || 0,
+        past_due: tbMoneyMax("Amount Past Due", block) || 0,
         term_months: term && Number(term[1]) > 1 ? Number(term[1]) : null,
         due_day: 1, kind: kindHit ? kindHit[1] : "other",
         account_last4: accountLast4(acct ? acct[1] : ""),
@@ -1059,6 +1099,7 @@
         dup.apr_derived = Boolean(d.apr_derived);
       }
       dup.balance = Math.max(dup.balance, d.balance);
+      dup.past_due = Math.max(dup.past_due || 0, d.past_due || 0);
       if (normDebtName(d.name).length > normDebtName(dup.name).length && !d.name.toLowerCase().includes("collection")) {
         dup.name = d.name;
       }
@@ -1096,16 +1137,29 @@
     "check amount", "direct deposit"];
   const STUB_GROSS_LABELS = ["gross pay", "total gross", "gross earnings", "total earnings"];
   const STUB_DATE_LABELS = ["pay date", "check date", "date paid", "deposit date",
-    "payment date", "advice date", "period end"];
+    "payment date", "advice date", "period end", "pay period"];
   const STUB_DATE_RE = "(\\d{4}-\\d{2}-\\d{2}|\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}|[A-Za-z]{3,9}\\.? \\d{1,2},? \\d{4})";
   const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7,
     sep: 8, oct: 9, nov: 10, dec: 11 };
 
   function stubAmount(labels, text) {
+    // same-line first: "Net Pay $1,719.68 $19,872.48" (current column, not YTD)
     for (const label of labels) {
       for (const m of text.matchAll(new RegExp(label + "\\W{0,20}?" + MONEY_RE, "gi"))) {
         const value = Number(m[1].replace(/,/g, ""));
         if (value > 0) return value;
+      }
+    }
+    // boxed layouts (Rippling etc.) put the value on a later line with other
+    // columns interleaved — take the first $-amount within reach of the label
+    for (const label of labels) {
+      for (const m of text.matchAll(new RegExp(label, "gi"))) {
+        const w = text.slice(m.index + m[0].length, m.index + m[0].length + 120)
+          .match(/\$\s?([\d,]+(?:\.\d{1,2})?)/);
+        if (w) {
+          const value = Number(w[1].replace(/,/g, ""));
+          if (value > 0) return value;
+        }
       }
     }
     return null;
@@ -1133,18 +1187,24 @@
     const amount = net || gross;
     if (!amount) return null;
     let date = "";
+    outer:
     for (const label of STUB_DATE_LABELS) {
-      const m = text.match(new RegExp(label + "\\W{0,20}?" + STUB_DATE_RE, "i"));
-      if (m) {
-        date = stubDate(m[1]);
-        if (date) break;
+      for (const m of text.matchAll(new RegExp(label, "gi"))) {
+        const window = text.slice(m.index + m[0].length, m.index + m[0].length + 450);
+        const dates = window.match(new RegExp(STUB_DATE_RE, "g")) || [];
+        // "pay period: 12/21 - 12/27" -> the period END is the payday side
+        const pick = label === "pay period" ? dates[dates.length - 1] : dates[0];
+        if (pick) {
+          date = stubDate(pick);
+          if (date) break outer;
+        }
       }
     }
     let source = "";
     for (let line of text.split(/\r?\n/)) {
-      line = line.replace(/\s+/g, " ").trim();
-      if (line.replace(/[^A-Za-z]/g, "").length >= 3 &&
-          !/earnings statement|pay ?stub|payroll advice|statement of/i.test(line)) {
+      line = line.replace(/earnings statement|pay ?stub|payroll advice|advice of deposit|statement of/gi, "")
+        .replace(/\s+/g, " ").trim();
+      if (line.replace(/[^A-Za-z]/g, "").length >= 3) {
         source = line.slice(0, 32);
         break;
       }
@@ -1190,18 +1250,21 @@
   // frequency boost, so a $50 delivery habit outranks a $60 gas
   // "optimization" — essentials are only squeezed after everything easier.
   const CUT_RULES = {
-    eliminate: [0.9, 0.05],  // convenience premium, cheap substitute exists
+    eliminate: [1.0, 0.05], // pure convenience premium — cut it entirely
     cancel: [1.0, 0.10],     // subscriptions
     trim: [0.5, 0.35],       // habits: go half as often
     tail: [0.3, 0.50],       // category one-offs
     squeeze: [0.1, 0.85],    // essentials: last resort, small shave
+    review: [0.0, 0.60],     // unidentified recurring charge: never counted as savings
   };
   const SQUEEZE_CATS = ["Groceries", "Gas & Fuel", "Transport"];
 
   const CUT_WORDING = {
     cancel: "cancel it — a subscription you're paying every month",
-    eliminate: "cut 90% — pure convenience, a cheap substitute exists",
+    eliminate: "cut it entirely — pure convenience, the substitute is free or already budgeted",
     trim: "go half as often",
+    review: "recurring charge the app can't identify — if it's a bill (insurance, rent), " +
+      "press Keep so it's never counted as cuttable; if it's an unwanted subscription, cancel it",
   };
 
   function cutPriority(cut, necessity, perMonth) {
@@ -1218,8 +1281,9 @@
   // freeing money for debt: names the actual merchants with monthly amounts,
   // frequency and example charges, tiered by pain (cancel subscriptions,
   // eliminate delivery/in-app spending, halve habits, trim the tail).
-  function buildCutPlan(transactions, months) {
+  function buildCutPlan(transactions, months, protectedLabels) {
     months = months || 6;
+    const protect = new Set((protectedLabels || []).map((p) => p.toLowerCase()));
     const monthSet = new Set();
     const groups = {};
     const catSpend = {};
@@ -1251,6 +1315,15 @@
       catSpend[t.category] = (catSpend[t.category] || 0) - t.amount;
     }
 
+    // drop protected merchants entirely (and their spend from category tails)
+    for (const key of Object.keys(groups)) {
+      const g = groups[key];
+      if (protect.has(g.label.toLowerCase())) {
+        catSpend[g.category] = (catSpend[g.category] || 0) - g.hits.reduce((s, h) => s + h[1], 0);
+        delete groups[key];
+      }
+    }
+
     const monthKeys = [...monthSet].sort().slice(-months);
     const nMonths = Math.max(1, monthKeys.length);
     const items = [];
@@ -1270,8 +1343,10 @@
         // a steady monthly charge is only "cancel a subscription" advice when
         // it lives in a subscription-ish category — a same-priced monthly
         // Target run is a habit, not a membership
-        if (steady && ["Subscriptions", "Entertainment", "Other"].includes(g.category)) {
+        if (steady && g.category === "Subscriptions") {
           action = "cancel";
+        } else if (steady) {
+          action = "review"; // could be insurance or rent — ask, don't advise
         } else if ((perMonth >= 4 || avg >= 40) && (monthsSeen >= 2 || kept.length >= 3)) {
           // a repeated habit — a single large one-off (new tires, a repair)
           // is NOT a habit to halve; it rolls into the tail
@@ -1326,6 +1401,7 @@
     // essentials last: real money, but you need to eat and get to work, so
     // only a small shave and always ranked after every discretionary cut
     for (const [cat, s] of Object.entries(squeeze)) {
+      if (protect.has(cat.toLowerCase())) continue;
       const avg = s.total / nMonths;
       const [fraction, necessity] = CUT_RULES.squeeze;
       const cut = avg * fraction;
@@ -1343,11 +1419,12 @@
       });
     }
 
-    items.sort((a, b) => b.priority - a.priority);
-    return items.slice(0, 10);
+    const kept2 = items.filter((i) => !protect.has(i.label.toLowerCase()));
+    kept2.sort((a, b) => b.priority - a.priority);
+    return kept2.slice(0, 10);
   }
 
-  function spendingSummary(transactions, months) {
+  function spendingSummary(transactions, months, protectedLabels) {
     months = months || 6;
     const byMonth = {};
     const incomeByMonth = {};
@@ -1406,7 +1483,7 @@
     }
     recurring.sort((a, b) => b.monthly_avg - a.monthly_avg);
 
-    const suggestions = buildCutPlan(transactions, months);
+    const suggestions = buildCutPlan(transactions, months, protectedLabels);
 
     const incomeKept = {};
     for (const m of Object.keys(incomeByMonth).sort().slice(-months)) {
@@ -1457,6 +1534,7 @@
       notes: d.notes || "",
       account_last4: d.account_last4 || "",
       apr_estimated: d.apr_estimated ? 1 : 0,
+      past_due: Math.max(0, Number(d.past_due) || 0),
     };
     if (d.id) {
       const existing = db.debts.find((x) => x.id === Number(d.id));
@@ -1486,7 +1564,7 @@
     const settings = getSettings(db);
     const bills = listBills(db);
     const debts = listDebts(db);
-    const plan = buildPlan(amount, payDate, bills, debts, settings);
+    const plan = buildPlan(amount, payDate, bills, debts, settings, db.goals || []);
 
     const extraMonthly = plan.totals.debt_extra * CHECKS_PER_MONTH[settings.pay_frequency];
     if (debts.length && extraMonthly > 0) {
@@ -1506,10 +1584,19 @@
         const bill = db.bills.find((x) => x.id === Number(billId));
         if (bill) bill.reserved = reserved;
       }
+      for (const [goalId, saved] of Object.entries(plan.goal_updates || {})) {
+        const goal = (db.goals || []).find((x) => x.id === Number(goalId));
+        if (goal) goal.saved = saved;
+      }
       for (const item of plan.items) {
-        if ((item.kind === "debt_min" || item.kind === "debt_extra") && item.debt_id) {
+        if (["debt_min", "debt_extra", "catchup"].includes(item.kind) && item.debt_id) {
           const debt = db.debts.find((x) => x.id === item.debt_id);
-          if (debt) debt.balance = r2(Math.max(0, debt.balance - item.amount));
+          if (debt) {
+            debt.balance = r2(Math.max(0, debt.balance - item.amount));
+            if (item.kind === "catchup") {
+              debt.past_due = r2(Math.max(0, (Number(debt.past_due) || 0) - item.amount));
+            }
+          }
         }
       }
       if (plan.totals.emergency > 0) {
@@ -1545,8 +1632,13 @@
     return {
       settings, debts, bills, paychecks,
       budget: estimateMonthlyExtra(bills, debts, settings, paychecks, listTransactions(db, 10000)),
+      goals: (db.goals || []).slice().sort((a, b) => a.due_date.localeCompare(b.due_date)),
       today: todayISO(),
     };
+  }
+
+  function protectedList(settings) {
+    try { return JSON.parse(settings.protected || "[]"); } catch (e) { return []; }
   }
 
   function handle(path, body) {
@@ -1576,7 +1668,7 @@
         // statements, and what sending it to debt would change.
         let advice = null;
         if (txns.length && debts.some((d) => d.balance > 0.01)) {
-          const summary = spendingSummary(txns, 6);
+          const summary = spendingSummary(txns, 6, protectedList(settings));
           if (summary.suggestions.length) {
             const target = pickTargetDebt(debts, settings.strategy);
             const cut = summary.potential_monthly_savings;
@@ -1602,7 +1694,7 @@
 
       case "/api/spending": {
         const txns = listTransactions(db, 10000);
-        const summary = spendingSummary(txns, Number(query.months) || 6);
+        const summary = spendingSummary(txns, Number(query.months) || 6, protectedList(settings));
         const debts = listDebts(db);
         const budget = estimateMonthlyExtra(listBills(db), debts, settings, listPaychecks(db), txns);
         const cut = summary.potential_monthly_savings;
@@ -1669,6 +1761,30 @@
         for (const b of Array.isArray(body) ? body : [body]) upsertBill(db, b);
         save(db);
         return { ok: true, bills: listBills(db) };
+
+      case "/api/goals": {
+        db.goals = db.goals || [];
+        const fields = {
+          name: (body.name || "Goal").trim(),
+          amount: Math.max(0, Number(body.amount) || 0),
+          saved: Math.max(0, Number(body.saved) || 0),
+          due_date: String(body.due_date || "").slice(0, 10),
+          notes: body.notes || "",
+        };
+        if (body.id) {
+          const g = db.goals.find((x) => x.id === Number(body.id));
+          if (g) Object.assign(g, fields);
+        } else {
+          db.goals.push(Object.assign({ id: nextId(db) }, fields));
+        }
+        save(db);
+        return { ok: true, goals: db.goals };
+      }
+
+      case "/api/goals/delete":
+        db.goals = (db.goals || []).filter((g) => g.id !== Number(body.id));
+        save(db);
+        return { ok: true };
 
       case "/api/bills/delete":
         db.bills = db.bills.filter((b) => b.id !== Number(body.id));

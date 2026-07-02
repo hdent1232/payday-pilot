@@ -73,6 +73,7 @@ async function loadState() {
   renderDashboard();
   renderDebts();
   renderBills();
+  renderGoals();
   renderPaycheckHistory();
   renderSettings();
 }
@@ -188,6 +189,14 @@ function renderActionPlan(p) {
     return due;
   };
   const steps = [];
+  // past-due catch-ups come before everything — today, not on a due day
+  for (const d of STATE.debts) {
+    if (d.past_due > 0.01 && d.balance > 0.01) {
+      steps.push({ date: today, badge: "debt_min", label: `CATCH UP ${d.name}`,
+        amount: Math.min(d.past_due, d.balance),
+        note: "past due — pay this before anything else" });
+    }
+  }
   for (const b of STATE.bills) {
     const owed = Math.max(0, b.amount - (b.reserved || 0));
     if (owed > 0.01) {
@@ -202,13 +211,22 @@ function renderActionPlan(p) {
         note: `${d.apr_estimated ? "~" : ""}${d.apr.toFixed(2)}% APR, ${money(d.balance)} left` });
     }
   }
+  // planned purchases: keep setting aside so the money is ready on the date
+  for (const g of STATE.goals || []) {
+    const needed = Math.max(0, g.amount - g.saved);
+    if (needed > 0.01) {
+      steps.push({ date: new Date(g.due_date + "T00:00:00"), badge: "reserve",
+        label: `Have "${g.name}" money ready`, amount: g.amount,
+        note: `${money(g.saved)} of ${money(g.amount)} set aside — ${money(goalPerCheck(g))}/paycheck` });
+    }
+  }
   if (!steps.length && !STATE.debts.length) {
     el.textContent = "Add your bills and debts, then import a bank statement — the app turns them " +
       "into a dated to-do list: pay this there on that day, stop spending here.";
     return;
   }
   steps.sort((a, b) => a.date - b.date);
-  const within30 = steps.filter((s) => (s.date - today) / 86400000 <= 30);
+  const within30 = steps.filter((s) => s.badge === "reserve" || (s.date - today) / 86400000 <= 30);
   let html = within30.map((s) => `<div class="plan-item">
       <span class="badge ${s.badge}">${fmtDate(s.date.toISOString().slice(0, 10))}</span>
       <span><span class="what">${esc(s.label)}</span><br><span class="why">${esc(s.note)}</span></span>
@@ -224,7 +242,7 @@ function renderActionPlan(p) {
   }
   // and: the specific spending to stop, feeding that payment
   if (p && p.advice && p.advice.suggestions.length) {
-    for (const s of p.advice.suggestions.slice(0, 3)) {
+    for (const s of p.advice.suggestions.filter((x) => x.suggested_cut > 0).slice(0, 3)) {
       html += `<div class="plan-item"><span class="badge fun">${esc(s.action)}</span>
         <span><span class="what">${{ cancel: "Cancel", eliminate: "Stop", squeeze: "Squeeze" }[s.action] || "Halve"} ${esc(s.label)}</span><br>
         <span class="why">${esc(s.message)}</span></span>
@@ -361,8 +379,10 @@ function renderPlanItems(plan, compact) {
   if (!compact) {
     const t = plan.totals;
     html += `<div class="summary-chips">
+      ${t.catch_up ? `<span class="chip">Catch-up: <b>${money(t.catch_up)}</b></span>` : ""}
       <span class="chip">Bills: <b>${money(t.bills)}</b></span>
       <span class="chip">Debt minimums: <b>${money(t.debt_min)}</b></span>
+      ${t.goals ? `<span class="chip">Purchases: <b>${money(t.goals)}</b></span>` : ""}
       <span class="chip">Extra to debt: <b>${money(t.debt_extra)}</b></span>
       <span class="chip">Essentials: <b>${money(t.essentials)}</b></span>
       <span class="chip">Emergency: <b>${money(t.emergency)}</b></span>
@@ -374,6 +394,7 @@ function renderPlanItems(plan, compact) {
     <div class="plan-item">
       <span class="badge ${i.kind}">${{
         bill: "pay bill", reserve: "set aside", debt_min: "debt min", debt_extra: "extra debt",
+        catchup: "catch up", goal: "purchase",
         essentials: "essentials", emergency: "emergency", fun: "fun", savings: "savings",
       }[i.kind] || i.kind}</span>
       <span><span class="what">${esc(i.action)}</span><br><span class="why">${esc(i.note)}</span></span>
@@ -442,7 +463,7 @@ function renderDebts() {
     return;
   }
   tbody.innerHTML = STATE.debts.map((d) => `<tr>
-      <td>${esc(d.name)}</td><td>${KIND_LABELS[d.kind] || esc(d.kind)}</td>
+      <td>${esc(d.name)}${d.past_due > 0 ? `<br><span class="why" style="color:var(--red)">⚠ ${money(d.past_due)} past due</span>` : ""}</td><td>${KIND_LABELS[d.kind] || esc(d.kind)}</td>
       <td class="num">${money(d.balance)}</td><td class="num" ${d.apr_estimated ? 'title="estimated — edit to your real rate"' : ""}>${d.apr_estimated ? "~" : ""}${d.apr.toFixed(2)}%</td>
       <td class="num">${money(d.min_payment)}</td><td class="num">${d.term_months ?? "—"}</td>
       <td class="num">${d.due_day}</td>
@@ -452,6 +473,7 @@ function renderDebts() {
     const d = STATE.debts.find((x) => x.id == b.dataset.edit);
     $("#d-id").value = d.id; $("#d-name").value = d.name; $("#d-kind").value = d.kind;
     $("#d-balance").value = d.balance; $("#d-apr").value = d.apr; $("#d-min").value = d.min_payment;
+    $("#d-pastdue").value = d.past_due || 0;
     $("#d-term").value = d.term_months ?? ""; $("#d-due").value = d.due_day;
     $("#d-submit").textContent = "Save debt"; $("#d-cancel").style.display = "";
   }));
@@ -469,6 +491,7 @@ $("#debt-form").addEventListener("submit", async (e) => {
     name: $("#d-name").value, kind: $("#d-kind").value,
     balance: $("#d-balance").value, apr: $("#d-apr").value,
     min_payment: $("#d-min").value, term_months: $("#d-term").value || null,
+    past_due: $("#d-pastdue").value || 0,
     due_day: $("#d-due").value,
   });
   resetDebtForm();
@@ -571,6 +594,7 @@ $("#debt-import-parse").addEventListener("click", async () => {
         name: ex.name,
         apr: userSetApr ? ex.apr : (row.apr || ex.apr),
         apr_estimated: userSetApr ? false : (row.apr ? !!row.apr_estimated : !!ex.apr_estimated),
+        past_due: row.past_due != null ? row.past_due : ex.past_due,
         min_payment: row.min_payment || ex.min_payment,
         kind: row.kind !== "other" ? row.kind : ex.kind,
         term_months: row.term_months || ex.term_months,
@@ -664,18 +688,37 @@ async function loadProjection() {
     html += chartSVG(active.timeline.map((t) => t.total_balance));
   }
   el.innerHTML = html;
+  bindKeepButtons(el);
 }
 
 // One line per concrete money-saving move: named merchant, how often it's
-// hit, example charges, and what stopping it frees up.
+// hit, example charges, and what stopping it frees up. Every line has a
+// "keep" button — press it and that merchant is never suggested again and
+// never counted in the freed-money math.
 function cutItemsHTML(items) {
-  const badge = { cancel: "debt_min", eliminate: "debt_extra", trim: "fun", squeeze: "reserve" };
+  const badge = { cancel: "debt_min", eliminate: "debt_extra", trim: "fun", squeeze: "reserve", review: "emergency" };
   return items.map((s) => `<div class="plan-item">
     <span class="badge ${badge[s.action] || "fun"}">${esc(s.action)}</span>
     <span><span class="what">${esc(s.label)}</span> — ${esc(s.message)}${
       s.examples && s.examples.length
         ? `<br><span class="why">${s.examples.map(esc).join(" · ")}</span>` : ""}</span>
-    <span class="amt">+${money(s.suggested_cut)}/mo</span></div>`).join("");
+    <span class="amt">${s.suggested_cut > 0 ? "+" + money(s.suggested_cut) + "/mo" : "—"}
+      <br><button class="mini ghost" data-keep="${esc(s.label)}" title="I can't / won't cut this — stop suggesting it and stop counting it as freed money">keep</button></span>
+  </div>`).join("");
+}
+
+function bindKeepButtons(container) {
+  container.querySelectorAll("[data-keep]").forEach((b) => b.addEventListener("click", async () => {
+    let protectedList = [];
+    try { protectedList = JSON.parse(STATE.settings.protected || "[]"); } catch (e) { /* reset */ }
+    if (!protectedList.includes(b.dataset.keep)) protectedList.push(b.dataset.keep);
+    await api("/api/settings", { protected: JSON.stringify(protectedList) });
+    toast(`Kept: ${b.dataset.keep} — it won't be suggested or counted as savings anymore. ` +
+      "If it's a bill, also add it on the Bills tab so it's planned.");
+    await loadState();
+    loadProjection();
+    if (typeof loadSpending === "function") loadSpending();
+  }));
 }
 
 function chartSVG(values) {
@@ -719,6 +762,54 @@ function renderBills() {
     await loadState();
   }));
 }
+
+// ------------------------------------------------------------- goals
+
+// How much this paycheck cadence needs to set aside per check to hit the date.
+function goalPerCheck(g) {
+  const today = new Date((STATE.today || new Date().toISOString().slice(0, 10)) + "T00:00:00");
+  const due = new Date(g.due_date + "T00:00:00");
+  const needed = Math.max(0, g.amount - g.saved);
+  if (needed <= 0 || due < today) return 0;
+  const period = { weekly: 7, biweekly: 14, semimonthly: 15, monthly: 30 }[STATE.settings.pay_frequency] || 14;
+  const checks = Math.max(1, Math.floor((due - today) / 86400000 / period) + 1);
+  return needed / checks;
+}
+
+function renderGoals() {
+  const tbody = $("#goal-table tbody");
+  const goals = STATE.goals || [];
+  if (!goals.length) {
+    tbody.innerHTML = "<tr><td colspan='6' class='muted'>Nothing planned — add a purchase and the app will set money aside for it each paycheck.</td></tr>";
+    return;
+  }
+  tbody.innerHTML = goals.map((g) => {
+    const done = g.saved >= g.amount - 0.01;
+    const late = !done && new Date(g.due_date) < new Date(STATE.today);
+    return `<tr>
+      <td>${esc(g.name)}${done ? " <span class='badge savings'>ready ✓</span>" : late ? " <span class='badge debt_min'>date passed</span>" : ""}</td>
+      <td class="num">${money(g.amount)}</td>
+      <td class="num">${money(g.saved)}</td>
+      <td>${fmtDate(g.due_date)}</td>
+      <td class="num">${done ? "—" : money(goalPerCheck(g))}</td>
+      <td><button class="mini danger ghost" data-gdel="${g.id}">✕</button></td></tr>`;
+  }).join("");
+  tbody.querySelectorAll("[data-gdel]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("Remove this planned purchase? (Money already set aside stays in your account.)")) return;
+    await api("/api/goals/delete", { id: Number(b.dataset.gdel) });
+    await loadState();
+  }));
+}
+
+$("#goal-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  await api("/api/goals", {
+    name: $("#g-name").value, amount: $("#g-amount").value, due_date: $("#g-due").value,
+  });
+  $("#goal-form").reset();
+  toast("Purchase planned — each paycheck now sets aside a share.");
+  await loadState();
+});
 
 $("#bill-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -854,6 +945,7 @@ async function loadSpending() {
       (s.cut_impact ? ` — put toward debt, that's <b>${s.cut_impact.months_saved} month(s) sooner</b> debt-free and <b>${money(s.cut_impact.interest_saved)}</b> less interest.` : ".") +
       `</div>`;
     sugEl.innerHTML = html;
+    bindKeepButtons(sugEl);
   }
 
   // recurring

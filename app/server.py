@@ -26,12 +26,14 @@ def _paycheck_snapshot(conn):
         "bills": db.list_bills(conn),
         "debts": db.list_debts(conn),
         "settings": db.get_settings(conn),
+        "goals": db.list_goals(conn),
     }
 
 
 def build_and_apply_plan(conn, amount, pay_date, source, apply_changes=True):
     snap = _paycheck_snapshot(conn)
-    plan = engine.build_plan(amount, pay_date, snap["bills"], snap["debts"], snap["settings"])
+    plan = engine.build_plan(amount, pay_date, snap["bills"], snap["debts"], snap["settings"],
+                             snap["goals"])
 
     # Payoff impact of this paycheck's extra payment, shown alongside the plan.
     extra_monthly = plan["totals"]["debt_extra"] * engine.CHECKS_PER_MONTH[snap["settings"]["pay_frequency"]]
@@ -48,11 +50,18 @@ def build_and_apply_plan(conn, amount, pay_date, source, apply_changes=True):
     if apply_changes:
         for bill_id, reserved in plan["reserve_updates"].items():
             db.set_bill_reserve(conn, bill_id, reserved)
+        for goal_id, saved in plan["goal_updates"].items():
+            db.set_goal_saved(conn, goal_id, saved)
         # Apply payments to debt balances so projections stay current.
         for item in plan["items"]:
-            if item["kind"] in ("debt_min", "debt_extra") and item.get("debt_id"):
+            if item["kind"] in ("debt_min", "debt_extra", "catchup") and item.get("debt_id"):
                 conn.execute(
                     "UPDATE debts SET balance = MAX(0, balance - ?) WHERE id=?",
+                    (item["amount"], item["debt_id"]),
+                )
+            if item["kind"] == "catchup" and item.get("debt_id"):
+                conn.execute(
+                    "UPDATE debts SET past_due = MAX(0, past_due - ?) WHERE id=?",
                     (item["amount"], item["debt_id"]),
                 )
         # Emergency fund balance moves with the plan.
@@ -128,6 +137,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({
                     "settings": settings, "debts": debts, "bills": bills,
                     "paychecks": paychecks, "budget": budget,
+                    "goals": db.list_goals(conn),
                     "today": date.today().isoformat(),
                 })
             elif route == "/api/projection":
@@ -147,7 +157,11 @@ class Handler(BaseHTTPRequestHandler):
                 # statements, and what sending it to debt would change.
                 advice = None
                 if txns and any(d["balance"] > 0.01 for d in debts):
-                    summary = importers.spending_summary(txns, 6)
+                    try:
+                        protected = json.loads(settings.get("protected") or "[]")
+                    except ValueError:
+                        protected = []
+                    summary = importers.spending_summary(txns, 6, protected)
                     if summary["suggestions"]:
                         strategy = settings["strategy"]
                         target = engine.pick_target_debt(debts, strategy)
@@ -175,9 +189,13 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/spending":
                 months = int(query.get("months", ["6"])[0])
                 txns = db.list_transactions(conn, limit=10000)
-                summary = importers.spending_summary(txns, months)
-                # How much sooner debt-free if suggested cuts go to debt?
                 settings = db.get_settings(conn)
+                try:
+                    protected = json.loads(settings.get("protected") or "[]")
+                except ValueError:
+                    protected = []
+                summary = importers.spending_summary(txns, months, protected)
+                # How much sooner debt-free if suggested cuts go to debt?
                 debts = db.list_debts(conn)
                 bills = db.list_bills(conn)
                 paychecks = db.list_paychecks(conn)
@@ -246,6 +264,12 @@ class Handler(BaseHTTPRequestHandler):
                 for b in (body if isinstance(body, list) else [body]):
                     db.upsert_bill(conn, b)
                 self._json({"ok": True, "bills": db.list_bills(conn)})
+            elif route == "/api/goals":
+                db.upsert_goal(conn, body)
+                self._json({"ok": True, "goals": db.list_goals(conn)})
+            elif route == "/api/goals/delete":
+                db.delete_goal(conn, body["id"])
+                self._json({"ok": True})
             elif route == "/api/bills/delete":
                 db.delete_bill(conn, body["id"])
                 self._json({"ok": True})

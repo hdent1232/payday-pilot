@@ -105,6 +105,8 @@
       <label>Balance $ <input type="number" step="0.01" min="0" id="d-balance" required></label>
       <label>APR % <input type="number" step="0.01" min="0" id="d-apr" value="0"></label>
       <label>Min payment $ <input type="number" step="0.01" min="0" id="d-min" value="0"></label>
+      <label>Past due $ <input type="number" step="0.01" min="0" id="d-pastdue" value="0"
+        title="Behind on this account? The app catches this up before anything else."></label>
       <label>Term months <input type="number" min="0" id="d-term" placeholder="optional"></label>
       <label>Due day <input type="number" min="1" max="28" id="d-due" value="1"></label>
       <button type="submit" class="primary" id="d-submit">Add debt</button>
@@ -165,6 +167,27 @@
       <button type="button" class="ghost" id="b-cancel" style="display:none">Cancel edit</button>
     </form>
     <div id="bill-total" class="muted"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Plan a purchase</h2>
+    <p class="muted small">Something you need money ready for by a date — a gift, a car repair, a deposit.
+      Each paycheck sets aside an equal share so the full amount is there on time; it's planned right
+      alongside your bills, before extra debt payments.</p>
+    <table class="table" id="goal-table">
+      <thead><tr>
+        <th>What</th><th class="num">Costs</th><th class="num">Saved so far</th><th>Needed by</th>
+        <th class="num">Per paycheck</th><th></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <form id="goal-form" class="row-form">
+      <input type="hidden" id="g-id">
+      <label>What <input id="g-name" placeholder="Anniversary gift" required></label>
+      <label>Costs $ <input type="number" step="0.01" min="0.01" id="g-amount" required></label>
+      <label>Needed by <input type="date" id="g-due" required></label>
+      <button type="submit" class="primary" id="g-submit">Add purchase</button>
+    </form>
   </div>
 </section>
 
