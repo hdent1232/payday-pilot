@@ -469,12 +469,15 @@ async function loadProjection() {
       : `Do all of these and you free <b>${money(p.advice.monthly_freed)}/mo</b> —
          debt-free in <b>${b.months} months</b> (${fmtDate(b.debt_free_date)})` +
         (active.stuck ? " instead of never." : `, paying ${money(b.total_interest)} total interest.`);
-    html += `<div class="findmoney"><h3>Find the money in your spending</h3>` +
-      p.advice.suggestions.map((s) => `<div class="plan-item">
-        <span class="badge fun">cut</span>
-        <span>You spend <b>${money(s.monthly_avg)}/mo</b> on ${esc(s.category)} — stop
-          ${money(s.suggested_cut)} of it and send that to <b>${target}</b> instead</span>
-        <span class="amt">+${money(s.suggested_cut)}/mo</span></div>`).join("") +
+    const tierNames = { cancel: "cancel subscriptions", eliminate: "cut out delivery & in-app buys", trim: "trim habits" };
+    const tiers = ["cancel", "eliminate", "trim"]
+      .map((a) => ({ a, sum: p.advice.suggestions.filter((s) => s.action === a)
+        .reduce((x, s) => x + s.suggested_cut, 0) }))
+      .filter((t) => t.sum > 0);
+    html += `<div class="findmoney"><h3>Find the money in your spending</h3>
+      <p class="muted small">Easiest first: ${tiers.map((t) => `${tierNames[t.a]} (<b>+${money(t.sum)}/mo</b>)`).join(", then ")}.
+        Every dollar goes to <b>${target}</b>.</p>` +
+      cutItemsHTML(p.advice.suggestions) +
       `<p class="muted small">${outcome}</p></div>`;
   } else if (active.stuck) {
     html += `<p class="muted small">Import your bank statements on the Spending tab and the app will
@@ -484,6 +487,18 @@ async function loadProjection() {
     html += chartSVG(active.timeline.map((t) => t.total_balance));
   }
   el.innerHTML = html;
+}
+
+// One line per concrete money-saving move: named merchant, how often it's
+// hit, example charges, and what stopping it frees up.
+function cutItemsHTML(items) {
+  const badge = { cancel: "debt_min", eliminate: "debt_extra", trim: "fun" };
+  return items.map((s) => `<div class="plan-item">
+    <span class="badge ${badge[s.action] || "fun"}">${esc(s.action)}</span>
+    <span><span class="what">${esc(s.label)}</span> — ${esc(s.message)}${
+      s.examples && s.examples.length
+        ? `<br><span class="why">${s.examples.map(esc).join(" · ")}</span>` : ""}</span>
+    <span class="amt">+${money(s.suggested_cut)}/mo</span></div>`).join("");
 }
 
 function chartSVG(values) {
@@ -655,10 +670,7 @@ async function loadSpending() {
   if (!s.suggestions.length) {
     sugEl.textContent = "No obvious cuts found yet — import more statements for better analysis.";
   } else {
-    let html = s.suggestions.map((x) => `<div class="plan-item">
-        <span class="badge fun">cut</span>
-        <span><span class="what">${esc(x.category)}</span><br><span class="why">${esc(x.message)}</span></span>
-        <span class="amt">−${money(x.suggested_cut)}/mo</span></div>`).join("");
+    let html = cutItemsHTML(s.suggestions);
     html += `<div class="okbox">Total potential: <b>${money(s.potential_monthly_savings)}/mo</b>` +
       (s.cut_impact ? ` — put toward debt, that's <b>${s.cut_impact.months_saved} month(s) sooner</b> debt-free and <b>${money(s.cut_impact.interest_saved)}</b> less interest.` : ".") +
       `</div>`;

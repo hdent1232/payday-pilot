@@ -1000,6 +1000,142 @@
     return desc.toLowerCase().replace(/[#*\d]/g, "").replace(/\s+/g, " ").trim().slice(0, 32);
   }
 
+  // ---------------------------------------------------------------- cut plan
+
+  // Known brands, grouped so "DOORDASH*TACOS" and "DOORDASH*WINGS" are one
+  // line. action: cancel = subscription you won't miss; eliminate =
+  // convenience premium with a cheap substitute (cut 100%); trim = habit to
+  // halve. Mirrors importers.CUT_BRANDS.
+  const CUT_BRANDS = [
+    ["doordash", "DoorDash", "eliminate"], ["uber eats", "Uber Eats", "eliminate"],
+    ["uber *eats", "Uber Eats", "eliminate"], ["uber * eats", "Uber Eats", "eliminate"],
+    ["ubereats", "Uber Eats", "eliminate"], ["grubhub", "Grubhub", "eliminate"],
+    ["instacart", "Instacart", "eliminate"], ["postmates", "Postmates", "eliminate"],
+    ["favor ", "Favor delivery", "eliminate"],
+    ["netflix", "Netflix", "cancel"], ["hulu", "Hulu", "cancel"],
+    ["spotify", "Spotify", "cancel"], ["disney", "Disney+", "cancel"],
+    ["hbo", "HBO Max", "cancel"], ["paramount", "Paramount+", "cancel"],
+    ["peacock", "Peacock", "cancel"], ["crunchyroll", "Crunchyroll", "cancel"],
+    ["youtube", "YouTube Premium", "cancel"], ["audible", "Audible", "cancel"],
+    ["patreon", "Patreon", "cancel"], ["onlyfans", "OnlyFans", "cancel"],
+    ["openai", "ChatGPT", "cancel"], ["chatgpt", "ChatGPT", "cancel"],
+    ["apple.com", "Apple subscriptions/in-app", "eliminate"],
+    ["google play", "Google Play in-app purchases", "eliminate"],
+    ["google *", "Google Play in-app purchases", "eliminate"],
+    ["xsolla", "In-game purchases (Xsolla)", "eliminate"],
+    ["playstation", "PlayStation purchases", "eliminate"],
+    ["xbox", "Xbox purchases", "eliminate"], ["steam", "Steam purchases", "eliminate"],
+    ["starbucks", "Starbucks", "trim"], ["dunkin", "Dunkin", "trim"],
+    ["mcdonald", "McDonald's", "trim"], ["chick-fil-a", "Chick-fil-A", "trim"],
+    ["taco bell", "Taco Bell", "trim"], ["chipotle", "Chipotle", "trim"],
+    ["whataburger", "Whataburger", "trim"], ["wendy", "Wendy's", "trim"],
+    ["raising cane", "Raising Cane's", "trim"], ["sonic", "Sonic", "trim"],
+  ];
+
+  const CUT_WORDING = {
+    cancel: "cancel it — a subscription you're paying every month",
+    eliminate: "cut it out — pick up / cook / skip the in-app buys instead",
+    trim: "go half as often",
+  };
+
+  function exampleLine(date, desc, amount) {
+    const clean = desc.replace(/\s+/g, " ").trim().slice(0, 28);
+    return `${date.slice(5)} ${clean} $${amount.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
+  }
+
+  // Mirrors importers.build_cut_plan — concrete, merchant-level plan for
+  // freeing money for debt: names the actual merchants with monthly amounts,
+  // frequency and example charges, tiered by pain (cancel subscriptions,
+  // eliminate delivery/in-app spending, halve habits, trim the tail).
+  function buildCutPlan(transactions, months) {
+    months = months || 6;
+    const monthSet = new Set();
+    const groups = {};
+    const catSpend = {};
+    for (const t of transactions) {
+      if (t.amount >= 0 || !DISCRETIONARY.has(t.category)) {
+        if (t.amount < 0 && !["Transfers", "Debt Payment"].includes(t.category)) {
+          monthSet.add(t.date.slice(0, 7));
+        }
+        continue;
+      }
+      const month = t.date.slice(0, 7);
+      monthSet.add(month);
+      const low = t.description.toLowerCase();
+      const brand = CUT_BRANDS.find(([kw]) => low.includes(kw)) || null;
+      const key = brand ? brand[1] : normalizeMerchant(t.description);
+      const g = groups[key] = groups[key] || {
+        label: brand ? brand[1] : t.description.replace(/\s+/g, " ").trim().slice(0, 32),
+        action: brand ? brand[2] : null,
+        category: t.category, hits: [],
+      };
+      g.hits.push([month, -t.amount, t.description, t.date]);
+      catSpend[t.category] = (catSpend[t.category] || 0) - t.amount;
+    }
+
+    const monthKeys = [...monthSet].sort().slice(-months);
+    const nMonths = Math.max(1, monthKeys.length);
+    const items = [];
+    for (const g of Object.values(groups)) {
+      const hits = g.hits.filter((h) => monthKeys.includes(h[0]));
+      const kept = hits.length ? hits : g.hits;
+      const total = kept.reduce((s, h) => s + h[1], 0);
+      const avg = total / nMonths;
+      if (avg < 10) continue;
+      const perMonth = kept.length / nMonths;
+      const amounts = kept.map((h) => h[1]);
+      let action = g.action;
+      if (!action) {
+        const steady = new Set(kept.map((h) => h[0])).size >= 2 && perMonth <= 1.5 &&
+          Math.max(...amounts) - Math.min(...amounts) <= Math.max(2.0, (total / kept.length) * 0.25);
+        // a steady monthly charge is only "cancel a subscription" advice when
+        // it lives in a subscription-ish category — a same-priced monthly
+        // Target run is a habit, not a membership
+        if (steady && ["Subscriptions", "Entertainment", "Other"].includes(g.category)) {
+          action = "cancel";
+        } else if (perMonth >= 4 || avg >= 40) {
+          action = "trim";
+        } else {
+          continue; // small one-offs roll into the category tail
+        }
+      }
+      const cut = action === "trim" ? avg / 2 : avg;
+      const biggest = kept.slice().sort((a, b) => b[1] - a[1]).slice(0, 3);
+      items.push({
+        action, label: g.label, category: g.category,
+        monthly_avg: r2(avg), suggested_cut: r2(cut),
+        per_month: Math.round(perMonth * 10) / 10,
+        months_seen: new Set(kept.map((h) => h[0])).size,
+        message: `$${Math.round(avg).toLocaleString("en-US")}/mo across ${Math.round(perMonth)} charge(s)/mo — ` +
+          CUT_WORDING[action],
+        examples: biggest.map((h) => exampleLine(h[3], h[2], h[1])),
+      });
+    }
+
+    // what's left of each category after the named merchants above
+    for (const [cat, total] of Object.entries(catSpend)) {
+      const named = items.filter((i) => i.category === cat).reduce((s, i) => s + i.monthly_avg, 0);
+      const rest = total / nMonths - named;
+      if (rest >= 30) {
+        const tail = Object.values(groups)
+          .filter((g) => g.category === cat && !items.some((i) => i.label === g.label))
+          .sort((a, b) => b.hits.reduce((s, h) => s + h[1], 0) - a.hits.reduce((s, h) => s + h[1], 0))
+          .slice(0, 3);
+        items.push({
+          action: "trim", label: `Other ${cat}`, category: cat,
+          monthly_avg: r2(rest), suggested_cut: r2(rest * 0.3),
+          per_month: null, months_seen: nMonths,
+          message: `$${Math.round(rest).toLocaleString("en-US")}/mo of one-offs — aim 30% lower`,
+          examples: tail.map((g) =>
+            `${g.label} $${Math.round(g.hits.reduce((s, h) => s + h[1], 0) / nMonths)}/mo`),
+        });
+      }
+    }
+
+    items.sort((a, b) => b.suggested_cut - a.suggested_cut);
+    return items.slice(0, 8);
+  }
+
   function spendingSummary(transactions, months) {
     months = months || 6;
     const byMonth = {};
@@ -1059,17 +1195,7 @@
     }
     recurring.sort((a, b) => b.monthly_avg - a.monthly_avg);
 
-    const suggestions = [];
-    for (const c of categories) {
-      if (c.discretionary && c.monthly_avg >= 20) {
-        const cut = r2(c.monthly_avg * 0.5);
-        suggestions.push({
-          category: c.category, monthly_avg: c.monthly_avg, suggested_cut: cut,
-          message: `You average $${Math.round(c.monthly_avg)}/mo on ${c.category}. ` +
-                   `Cutting half frees $${Math.round(cut)}/mo for debt payoff.`,
-        });
-      }
-    }
+    const suggestions = buildCutPlan(transactions, months);
 
     const incomeKept = {};
     for (const m of Object.keys(incomeByMonth).sort().slice(-months)) {
@@ -1245,7 +1371,7 @@
             const cut = summary.potential_monthly_savings;
             const boosted = simulatePayoff(debts, settings.strategy, extra + cut);
             advice = {
-              suggestions: summary.suggestions.slice(0, 5),
+              suggestions: summary.suggestions,
               monthly_freed: cut,
               target_debt: target ? target.name : null,
               boosted: {

@@ -154,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
                         cut = summary["potential_monthly_savings"]
                         boosted = engine.simulate_payoff(debts, strategy, extra + cut)
                         advice = {
-                            "suggestions": summary["suggestions"][:5],
+                            "suggestions": summary["suggestions"],
                             "monthly_freed": cut,
                             "target_debt": target["name"] if target else None,
                             "boosted": {

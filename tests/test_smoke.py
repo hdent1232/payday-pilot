@@ -466,6 +466,56 @@ class AdviceTest(unittest.TestCase):
         self.assertEqual(b2["monthly_income"], 3000.0)
 
 
+class CutPlanTest(unittest.TestCase):
+    def make(self):
+        txns = []
+        for m in ("2026-05", "2026-06"):
+            for day, desc, amt, cat in [
+                ("02", "HULU 888-2658259", -15.49, "Subscriptions"),
+                ("04", "DOORDASH*TACOS", -42.10, "Dining"),
+                ("08", "DOORDASH*WINGS", -55.30, "Dining"),
+                ("12", "DOORDASH*PIZZA", -61.00, "Dining"),
+                ("05", "STARBUCKS #4411", -7.85, "Dining"),
+                ("07", "STARBUCKS #4411", -9.10, "Dining"),
+                ("11", "STARBUCKS #4411", -8.40, "Dining"),
+                ("18", "STARBUCKS #4411", -11.25, "Dining"),
+                ("21", "GOOGLE *Clash of Clans", -19.99, "Entertainment"),
+                ("26", "GOOGLE *Clash of Clans", -39.99, "Entertainment"),
+                ("24", "TARGET 00021", -41.00, "Shopping"),
+                ("28", "KROGER #123", -180.00, "Groceries"),
+            ]:
+                txns.append({"date": f"{m}-{day}", "description": desc,
+                             "amount": amt, "category": cat})
+        return txns
+
+    def test_merchant_level_plan(self):
+        from app.importers import build_cut_plan
+        plan = {i["label"]: i for i in build_cut_plan(self.make(), 6)}
+        # delivery apps: eliminate 100%, brands grouped across order names
+        dd = plan["DoorDash"]
+        self.assertEqual(dd["action"], "eliminate")
+        self.assertAlmostEqual(dd["suggested_cut"], 158.40, places=2)
+        self.assertTrue(any("DOORDASH*PIZZA" in e and "$61.00" in e for e in dd["examples"]))
+        # subscriptions: cancel the whole thing
+        hulu = plan["Hulu"]
+        self.assertEqual((hulu["action"], hulu["suggested_cut"]), ("cancel", 15.49))
+        # mobile-game in-app purchases called out by name
+        game = plan["Google Play in-app purchases"]
+        self.assertEqual(game["action"], "eliminate")
+        self.assertTrue(any("Clash of Clans" in e for e in game["examples"]))
+        # habit: halve, not eliminate
+        sbux = plan["Starbucks"]
+        self.assertEqual(sbux["action"], "trim")
+        self.assertAlmostEqual(sbux["suggested_cut"], sbux["monthly_avg"] / 2, places=2)
+        # a same-priced monthly Target run is NOT a subscription to cancel
+        self.assertEqual(plan["TARGET 00021"]["action"], "trim")
+        # groceries are essential — never suggested
+        self.assertFalse(any("KROGER" in label for label in plan))
+        # biggest savings first
+        cuts = [i["suggested_cut"] for i in build_cut_plan(self.make(), 6)]
+        self.assertEqual(cuts, sorted(cuts, reverse=True))
+
+
 class EngineTest(unittest.TestCase):
     def test_payoff_math(self):
         from app.engine import simulate_payoff

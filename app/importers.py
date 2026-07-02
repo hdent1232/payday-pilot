@@ -743,17 +743,7 @@ def spending_summary(transactions, months=6):
                 })
     recurring.sort(key=lambda r: -r["monthly_avg"])
 
-    suggestions = []
-    for c in categories:
-        if c["discretionary"] and c["monthly_avg"] >= 20:
-            cut = round(c["monthly_avg"] * 0.5, 2)
-            suggestions.append({
-                "category": c["category"],
-                "monthly_avg": c["monthly_avg"],
-                "suggested_cut": cut,
-                "message": f"You average ${c['monthly_avg']:.0f}/mo on {c['category']}. "
-                           f"Cutting half frees ${cut:.0f}/mo for debt payoff.",
-            })
+    suggestions = build_cut_plan(transactions, months)
 
     return {
         "months": month_keys,
@@ -771,3 +761,132 @@ def _normalize_merchant(desc):
     d = re.sub(r"[#*\d]", "", desc.lower())
     d = re.sub(r"\s+", " ", d).strip()
     return d[:32]
+
+
+# ------------------------------------------------------------ cut plan
+
+# Known brands, grouped so "DOORDASH*TACOS" and "DOORDASH*WINGS" are one line.
+# action: cancel = subscription you won't miss; eliminate = convenience premium
+# with a cheap substitute (cut 100%); trim = habit to halve.
+CUT_BRANDS = (
+    ("doordash", "DoorDash", "eliminate"), ("uber eats", "Uber Eats", "eliminate"),
+    ("uber *eats", "Uber Eats", "eliminate"), ("uber * eats", "Uber Eats", "eliminate"),
+    ("ubereats", "Uber Eats", "eliminate"), ("grubhub", "Grubhub", "eliminate"),
+    ("instacart", "Instacart", "eliminate"), ("postmates", "Postmates", "eliminate"),
+    ("favor ", "Favor delivery", "eliminate"),
+    ("netflix", "Netflix", "cancel"), ("hulu", "Hulu", "cancel"),
+    ("spotify", "Spotify", "cancel"), ("disney", "Disney+", "cancel"),
+    ("hbo", "HBO Max", "cancel"), ("paramount", "Paramount+", "cancel"),
+    ("peacock", "Peacock", "cancel"), ("crunchyroll", "Crunchyroll", "cancel"),
+    ("youtube", "YouTube Premium", "cancel"), ("audible", "Audible", "cancel"),
+    ("patreon", "Patreon", "cancel"), ("onlyfans", "OnlyFans", "cancel"),
+    ("openai", "ChatGPT", "cancel"), ("chatgpt", "ChatGPT", "cancel"),
+    ("apple.com", "Apple subscriptions/in-app", "eliminate"),
+    ("google play", "Google Play in-app purchases", "eliminate"),
+    ("google *", "Google Play in-app purchases", "eliminate"),
+    ("xsolla", "In-game purchases (Xsolla)", "eliminate"),
+    ("playstation", "PlayStation purchases", "eliminate"),
+    ("xbox", "Xbox purchases", "eliminate"), ("steam", "Steam purchases", "eliminate"),
+    ("starbucks", "Starbucks", "trim"), ("dunkin", "Dunkin", "trim"),
+    ("mcdonald", "McDonald's", "trim"), ("chick-fil-a", "Chick-fil-A", "trim"),
+    ("taco bell", "Taco Bell", "trim"), ("chipotle", "Chipotle", "trim"),
+    ("whataburger", "Whataburger", "trim"), ("wendy", "Wendy's", "trim"),
+    ("raising cane", "Raising Cane's", "trim"), ("sonic", "Sonic", "trim"),
+)
+
+_CUT_WORDING = {
+    "cancel": "cancel it — a subscription you're paying every month",
+    "eliminate": "cut it out — pick up / cook / skip the in-app buys instead",
+    "trim": "go half as often",
+}
+
+
+def _example_line(date, desc, amount):
+    clean = re.sub(r"\s+", " ", desc).strip()[:28]
+    return f"{date[5:]} {clean} ${amount:,.2f}"
+
+
+def build_cut_plan(transactions, months=6):
+    """Concrete, merchant-level plan for freeing money for debt.
+
+    Instead of "cut the category in half": names the actual merchants with
+    monthly amounts, how often they're hit, and example charges. Tiers the
+    moves by pain: cancel subscriptions (painless), eliminate delivery/in-app
+    convenience spending (cheap substitute exists), halve habits, then trim
+    what's left of each category.
+    """
+    month_set = set()
+    groups = {}
+    cat_spend = {}
+    for t in transactions:
+        if t["amount"] >= 0 or t["category"] not in DISCRETIONARY:
+            if t["amount"] < 0 and t["category"] not in ("Transfers", "Debt Payment"):
+                month_set.add(t["date"][:7])
+            continue
+        month = t["date"][:7]
+        month_set.add(month)
+        low = t["description"].lower()
+        brand = next(((label, action) for kw, label, action in CUT_BRANDS if kw in low), None)
+        key = brand[0] if brand else _normalize_merchant(t["description"])
+        g = groups.setdefault(key, {
+            "label": brand[0] if brand else re.sub(r"\s+", " ", t["description"]).strip()[:32],
+            "action": brand[1] if brand else None,
+            "category": t["category"], "hits": [],
+        })
+        g["hits"].append((month, -t["amount"], t["description"], t["date"]))
+        cat_spend[t["category"]] = cat_spend.get(t["category"], 0) - t["amount"]
+
+    month_keys = sorted(month_set)[-months:]
+    n_months = max(1, len(month_keys))
+    items = []
+    for g in groups.values():
+        hits = [h for h in g["hits"] if h[0] in month_keys] or g["hits"]
+        total = sum(a for _, a, _, _ in hits)
+        avg = total / n_months
+        if avg < 10:
+            continue
+        per_month = len(hits) / n_months
+        amounts = [a for _, a, _, _ in hits]
+        action = g["action"]
+        if not action:
+            steady = (len({m for m, _, _, _ in hits}) >= 2 and per_month <= 1.5
+                      and max(amounts) - min(amounts) <= max(2.0, (total / len(hits)) * 0.25))
+            # a steady monthly charge is only "cancel a subscription" advice
+            # when it lives in a subscription-ish category — a same-priced
+            # monthly Target run is a habit, not a membership
+            if steady and g["category"] in ("Subscriptions", "Entertainment", "Other"):
+                action = "cancel"
+            elif per_month >= 4 or avg >= 40:
+                action = "trim"
+            else:
+                continue  # small one-offs roll into the category tail
+        cut = avg if action in ("cancel", "eliminate") else avg / 2
+        biggest = sorted(hits, key=lambda h: -h[1])[:3]
+        items.append({
+            "action": action, "label": g["label"], "category": g["category"],
+            "monthly_avg": round(avg, 2), "suggested_cut": round(cut, 2),
+            "per_month": round(per_month, 1), "months_seen": len({m for m, _, _, _ in hits}),
+            "message": f"${avg:,.0f}/mo across {per_month:.0f} charge(s)/mo — "
+                       + _CUT_WORDING[action],
+            "examples": [_example_line(d, desc, a) for _, a, desc, d in biggest],
+        })
+
+    # what's left of each category after the named merchants above
+    for cat, total in cat_spend.items():
+        named = sum(i["monthly_avg"] for i in items if i["category"] == cat)
+        rest = total / n_months - named
+        if rest >= 30:
+            tail = sorted((g for g in groups.values()
+                           if g["category"] == cat and not any(i["label"] == g["label"] for i in items)),
+                          key=lambda g: -sum(a for _, a, _, _ in g["hits"]))[:3]
+            items.append({
+                "action": "trim", "label": f"Other {cat}", "category": cat,
+                "monthly_avg": round(rest, 2), "suggested_cut": round(rest * 0.3, 2),
+                "per_month": None, "months_seen": n_months,
+                "message": f"${rest:,.0f}/mo of one-offs — aim 30% lower",
+                "examples": [f"{g['label']} ${sum(a for _, a, _, _ in g['hits']) / n_months:,.0f}/mo"
+                             for g in tail],
+            })
+
+    items.sort(key=lambda i: -i["suggested_cut"])
+    return items[:8]
