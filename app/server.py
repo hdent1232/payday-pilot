@@ -203,11 +203,18 @@ class Handler(BaseHTTPRequestHandler):
                                 "stuck": boosted["stuck"],
                             },
                         }
+                bank_balance = settings.get("bank_balance") or ""
+                forecast = engine.cash_flow_forecast(
+                    float(bank_balance) if bank_balance != "" else 0,
+                    budget.get("pattern"), bills, debts, db.list_goals(conn),
+                    settings, date.today())
+                forecast["balance_known"] = bank_balance != ""
                 self._json({
                     "budget": budget,
                     "comparison": engine.compare_strategies(debts, extra),
                     "extra_used": extra,
                     "advice": advice,
+                    "forecast": forecast,
                 })
             elif route == "/api/transactions":
                 self._json({"transactions": db.list_transactions(conn)})

@@ -708,6 +708,98 @@ class ProtectedTest(unittest.TestCase):
         self.assertFalse(any(i["category"] == "Dining" and i["suggested_cut"] > 0 for i in kept))
 
 
+class CashFlowForecastTest(unittest.TestCase):
+    SETTINGS = {"pay_frequency": "biweekly", "strategy": "avalanche",
+                "emergency_target": "0", "emergency_balance": "0", "emergency_pct": "0",
+                "fun_pct": "0", "variable_budget": "300", "monthly_net_income": "0"}
+    PATTERN = {"gap_days": 14, "frequency": "biweekly", "typical_amount": 1200,
+               "next_payday": "2026-07-10", "checks_seen": 8}
+
+    def forecast(self, balance, bills=(), debts=(), goals=()):
+        from datetime import date
+        from app.engine import cash_flow_forecast
+        return cash_flow_forecast(balance, self.PATTERN, list(bills), list(debts),
+                                  list(goals), self.SETTINGS, date(2026, 7, 2))
+
+    def test_everything_covered_when_income_suffices(self):
+        f = self.forecast(1500, bills=[{"name": "Rent", "amount": 1097, "due_day": 1, "reserved": 0}],
+                          debts=[{"name": "Westlake", "balance": 9302, "apr": 25.28,
+                                  "min_payment": 441, "due_day": 8, "past_due": 0}])
+        self.assertTrue(f["feasible"])
+        rent = next(i for i in f["items"] if i["label"] == "Rent" and i["date"] == "2026-08-01")
+        self.assertTrue(rent["covered"])  # the Aug 1 rent question, answered with math
+
+    def test_shortfall_is_named_with_date_and_amount(self):
+        # $50 in the bank, no income until the 10th, $441 due the 8th
+        f = self.forecast(50, debts=[{"name": "Westlake", "balance": 9302, "apr": 25.28,
+                                      "min_payment": 441, "due_day": 8, "past_due": 0}])
+        self.assertFalse(f["feasible"])
+        self.assertEqual(f["first_shortfall"]["date"], "2026-07-08")
+        self.assertIn("Westlake", f["first_shortfall"]["label"])
+        self.assertGreater(f["first_shortfall"]["short"], 0)
+
+    def test_caught_up_by_date(self):
+        from datetime import date
+        from app.engine import cash_flow_forecast
+        bills = [{"name": "Rent", "amount": 1097, "due_day": 1, "reserved": 0}]
+        debts = [
+            {"name": "College Ave", "balance": 31397, "apr": 23.81,
+             "min_payment": 835, "due_day": 13, "past_due": 1309},
+            {"name": "EdFinancial", "balance": 6280, "apr": 7.75,
+             "min_payment": 66, "due_day": 1, "past_due": 462},
+        ]
+        # enough income: caught up within the horizon, WITHOUT causing any
+        # missed current payment
+        rich = dict(self.PATTERN, typical_amount=1700)
+        f = cash_flow_forecast(800, rich, bills, debts, [], self.SETTINGS, date(2026, 7, 2))
+        self.assertEqual(f["past_due_total"], 1771)
+        self.assertTrue(f["feasible"])
+        self.assertIsNotNone(f["caught_up_by"])
+        self.assertLessEqual(f["caught_up_by"], f["horizon_end"])
+        self.assertEqual(f["arrears_left"], 0)
+        catchups = [i for i in f["items"] if i["label"] == "Catch up past-due"]
+        self.assertAlmostEqual(sum(c["amount"] for c in catchups), 1771, places=2)
+
+    def test_catching_up_never_causes_a_missed_payment(self):
+        # thin income: can NOT fully catch up in the horizon — and the
+        # forecast must say so honestly instead of robbing a future payment
+        f = self.forecast(800,
+                          bills=[{"name": "Rent", "amount": 1097, "due_day": 1, "reserved": 0}],
+                          debts=[
+                              {"name": "College Ave", "balance": 31397, "apr": 23.81,
+                               "min_payment": 835, "due_day": 13, "past_due": 1309},
+                              {"name": "EdFinancial", "balance": 6280, "apr": 7.75,
+                               "min_payment": 66, "due_day": 1, "past_due": 462},
+                          ])
+        self.assertTrue(f["feasible"])           # no current payment ever missed
+        self.assertIsNone(f["caught_up_by"])     # honest: not caught up in 60 days
+        self.assertGreater(f["arrears_left"], 0)
+        self.assertTrue(all(i["covered"] for i in f["items"]))
+
+    def test_unidentified_spending_lists_real_transactions(self):
+        from app.importers import build_cut_plan
+        txns = [
+            {"date": "2026-06-24", "description": "ETT*CrestviewOperating 801-87754", "amount": -235.00,
+             "category": "Other"},
+            {"date": "2026-05-11", "description": "CAPITOL GIFTSHOP EXT AUSTIN TX A", "amount": -85.00,
+             "category": "Other"},
+        ]
+        plan = build_cut_plan(txns, 6)
+        unid = next(i for i in plan if i["label"] == "Unidentified spending")
+        self.assertEqual(unid["action"], "review")
+        self.assertEqual(unid["suggested_cut"], 0)  # never counted as savings
+        # the ACTUAL transactions, with dates and amounts
+        self.assertTrue(any("CrestviewOperating" in e and "$235.00" in e for e in unid["examples"]))
+        self.assertTrue(any("CAPITOL GIFTSHOP" in e and "$85.00" in e for e in unid["examples"]))
+
+    def test_heb_is_groceries(self):
+        from app.importers import categorize, merge_rules
+        self.assertEqual(categorize("POS8339 H-E-B #673 ROUND ROCK TX", merge_rules([])),
+                         "Groceries")
+        self.assertEqual(categorize("CRESTVIEW APARTMENTS APPLICATION FEE", merge_rules([])),
+                         "Housing")
+
+
 class PaycheckPatternTest(unittest.TestCase):
     def test_pattern_learned_from_history(self):
         from app.engine import paycheck_pattern

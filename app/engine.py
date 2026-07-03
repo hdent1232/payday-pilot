@@ -353,6 +353,121 @@ def _add_months(d, months):
     return date(year, month, day)
 
 
+def cash_flow_forecast(start_balance, pattern, bills, debts, goals, settings, today,
+                       horizon_days=62):
+    """Day-by-day cash-flow simulation: can every upcoming payment actually be
+    made on time with the learned paychecks and the current bank balance?
+
+    Income lands on predicted paydays (learned gap + typical amount), every
+    bill/minimum/goal is subtracted on its due date, essentials drip out
+    daily, and on each payday whatever is left over — after protecting every
+    payment due before the NEXT payday — goes to past-due balances. Returns
+    per-payment covered/short flags, the first shortfall, and the date the
+    user is fully caught up on arrears.
+    """
+    end = today + timedelta(days=horizon_days)
+    incomes = set()
+    typical = 0
+    if pattern:
+        typical = pattern["typical_amount"]
+        d = parse_date(pattern["next_payday"])
+        while d <= end:
+            if d >= today:
+                incomes.add(d)
+            d += timedelta(days=pattern["gap_days"])
+
+    outflows = []  # [date, label, amount]
+    for b in bills:
+        due = next_due_date(b["due_day"], today)
+        first = True
+        while due <= end:
+            amt = round(max(0.0, b["amount"] - (b["reserved"] if first else 0.0)), 2)
+            if amt > 0.005:
+                outflows.append([due, b["name"], amt])
+            due = next_due_date(b["due_day"], due + timedelta(days=1))
+            first = False
+    for d_ in debts:
+        if d_["balance"] <= 0.01 or d_["min_payment"] <= 0:
+            continue
+        due = next_due_date(d_["due_day"], today)
+        while due <= end:
+            outflows.append([due, f"{d_['name']} minimum",
+                             round(min(d_["min_payment"], d_["balance"]), 2)])
+            due = next_due_date(d_["due_day"], due + timedelta(days=1))
+    for g in goals or []:
+        needed = round(max(0.0, g["amount"] - g["saved"]), 2)
+        if needed > 0.005 and g.get("due_date"):
+            due = parse_date(g["due_date"])
+            if today <= due <= end:
+                outflows.append([due, g["name"], needed])
+    outflows.sort(key=lambda o: o[0])
+
+    past_due_total = round(sum(min(float(d_.get("past_due") or 0), d_["balance"])
+                               for d_ in debts), 2)
+    daily_essentials = float(settings["variable_budget"]) / AVG_DAYS_PER_MONTH
+
+    balance = float(start_balance or 0)
+    arrears = past_due_total
+    caught_up = today if arrears <= 0.005 else None
+    items = []
+    first_short = None
+    day = today
+    while day <= end:
+        if day in incomes:
+            balance = round(balance + typical, 2)
+        for due, label, amt in outflows:
+            if due != day:
+                continue
+            covered = balance >= amt - 0.005
+            balance = round(balance - amt, 2)
+            items.append({"date": day.isoformat(), "label": label, "amount": amt,
+                          "covered": covered, "balance_after": balance})
+            if not covered and first_short is None:
+                first_short = {"date": day.isoformat(), "label": label,
+                               "short": round(amt - (balance + amt), 2)}
+        balance = round(balance - daily_essentials, 2)
+        if day in incomes and arrears > 0.005:
+            # arrears only ever get money NO future payment needs: simulate
+            # forward with zero extra payments and find the lowest balance
+            # the future ever reaches — that floor is the safe amount to send
+            # today. Catching up can never cause a missed current payment.
+            future_balance = balance
+            floor = balance
+            probe = day + timedelta(days=1)
+            while probe <= end:
+                if probe in incomes:
+                    future_balance += typical
+                for due, _, amt in outflows:
+                    if due == probe:
+                        future_balance -= amt
+                future_balance -= daily_essentials
+                floor = min(floor, future_balance)
+                probe += timedelta(days=1)
+            pay = round(min(arrears, max(0.0, floor)), 2)
+            if pay > 0.005:
+                arrears = round(arrears - pay, 2)
+                balance = round(balance - pay, 2)
+                items.append({"date": day.isoformat(), "label": "Catch up past-due",
+                              "amount": pay, "covered": True, "balance_after": balance})
+                if arrears <= 0.005 and caught_up is None:
+                    caught_up = day
+        day += timedelta(days=1)
+
+    return {
+        "start_balance": round(float(start_balance or 0), 2),
+        "income_per_check": typical,
+        "checks_in_horizon": len(incomes),
+        "past_due_total": past_due_total,
+        "items": items,
+        "first_shortfall": first_short,
+        "feasible": first_short is None,
+        "caught_up_by": caught_up.isoformat() if caught_up else None,
+        "arrears_left": round(arrears, 2),
+        "end_balance": round(balance, 2),
+        "horizon_end": end.isoformat(),
+    }
+
+
 def paycheck_pattern(paychecks):
     """Pay cadence learned from paycheck history: median gap between checks,
     typical (median) amount, and the predicted next payday. Needs >= 3 checks."""

@@ -377,6 +377,127 @@
     };
   }
 
+  // Day-by-day cash-flow simulation: can every upcoming payment actually be
+  // made on time with the learned paychecks and the current bank balance?
+  // Mirrors engine.cash_flow_forecast.
+  function cashFlowForecast(startBalance, pattern, bills, debts, goals, settings, todayStr, horizonDays) {
+    horizonDays = horizonDays || 62;
+    const today = new Date(todayStr + "T00:00:00");
+    const end = new Date(today); end.setDate(end.getDate() + horizonDays);
+    const iso = (d) => d.toISOString().slice(0, 10);
+    const incomes = new Set();
+    let typical = 0;
+    if (pattern) {
+      typical = pattern.typical_amount;
+      let d = new Date(pattern.next_payday + "T00:00:00");
+      while (d <= end) {
+        if (d >= today) incomes.add(iso(d));
+        d = new Date(d); d.setDate(d.getDate() + pattern.gap_days);
+      }
+    }
+    const nextDueFrom = (dueDay, from) => {
+      const day = Math.max(1, Math.min(28, dueDay));
+      const due = new Date(from); due.setDate(day);
+      if (due < from) due.setMonth(due.getMonth() + 1);
+      return due;
+    };
+    const outflows = []; // [Date, label, amount]
+    for (const b of bills) {
+      let due = nextDueFrom(b.due_day, today);
+      let first = true;
+      while (due <= end) {
+        const amt = r2(Math.max(0, b.amount - (first ? (b.reserved || 0) : 0)));
+        if (amt > 0.005) outflows.push([new Date(due), b.name, amt]);
+        const nxt = new Date(due); nxt.setDate(nxt.getDate() + 1);
+        due = nextDueFrom(b.due_day, nxt);
+        first = false;
+      }
+    }
+    for (const d_ of debts) {
+      if (d_.balance <= 0.01 || d_.min_payment <= 0) continue;
+      let due = nextDueFrom(d_.due_day, today);
+      while (due <= end) {
+        outflows.push([new Date(due), d_.name + " minimum", r2(Math.min(d_.min_payment, d_.balance))]);
+        const nxt = new Date(due); nxt.setDate(nxt.getDate() + 1);
+        due = nextDueFrom(d_.due_day, nxt);
+      }
+    }
+    for (const g of goals || []) {
+      const needed = r2(Math.max(0, g.amount - g.saved));
+      if (needed > 0.005 && g.due_date) {
+        const due = new Date(g.due_date + "T00:00:00");
+        if (due >= today && due <= end) outflows.push([due, g.name, needed]);
+      }
+    }
+    outflows.sort((a, b) => a[0] - b[0]);
+
+    const pastDueTotal = r2(debts.reduce((s, d_) =>
+      s + Math.min(Number(d_.past_due) || 0, d_.balance), 0));
+    const dailyEssentials = Number(settings.variable_budget) / AVG_DAYS_PER_MONTH;
+
+    let balance = Number(startBalance) || 0;
+    let arrears = pastDueTotal;
+    let caughtUp = arrears <= 0.005 ? iso(today) : null;
+    const items = [];
+    let firstShort = null;
+    const day = new Date(today);
+    while (day <= end) {
+      const dayIso = iso(day);
+      if (incomes.has(dayIso)) balance = r2(balance + typical);
+      for (const of_ of outflows) {
+        if (iso(of_[0]) !== dayIso) continue;
+        const label = of_[1], amt = of_[2];
+        const covered = balance >= amt - 0.005;
+        balance = r2(balance - amt);
+        items.push({ date: dayIso, label, amount: amt, covered, balance_after: balance });
+        if (!covered && !firstShort) {
+          firstShort = { date: dayIso, label, short: r2(amt - (balance + amt)) };
+        }
+      }
+      balance = r2(balance - dailyEssentials);
+      if (incomes.has(dayIso) && arrears > 0.005) {
+        // arrears only ever get money NO future payment needs: simulate
+        // forward with zero extra payments and find the lowest balance the
+        // future ever reaches — that floor is the safe amount to send today.
+        // Catching up can never cause a missed current payment.
+        let futureBalance = balance;
+        let floor = balance;
+        const probe = new Date(day); probe.setDate(probe.getDate() + 1);
+        while (probe <= end) {
+          const probeIso = iso(probe);
+          if (incomes.has(probeIso)) futureBalance += typical;
+          for (const of_ of outflows) {
+            if (iso(of_[0]) === probeIso) futureBalance -= of_[2];
+          }
+          futureBalance -= dailyEssentials;
+          floor = Math.min(floor, futureBalance);
+          probe.setDate(probe.getDate() + 1);
+        }
+        const pay = r2(Math.min(arrears, Math.max(0, floor)));
+        if (pay > 0.005) {
+          arrears = r2(arrears - pay);
+          balance = r2(balance - pay);
+          items.push({ date: dayIso, label: "Catch up past-due", amount: pay, covered: true, balance_after: balance });
+          if (arrears <= 0.005 && !caughtUp) caughtUp = dayIso;
+        }
+      }
+      day.setDate(day.getDate() + 1);
+    }
+    return {
+      start_balance: r2(Number(startBalance) || 0),
+      income_per_check: typical,
+      checks_in_horizon: incomes.size,
+      past_due_total: pastDueTotal,
+      items,
+      first_shortfall: firstShort,
+      feasible: !firstShort,
+      caught_up_by: caughtUp,
+      arrears_left: r2(arrears),
+      end_balance: r2(balance),
+      horizon_end: iso(end),
+    };
+  }
+
   // Pay cadence learned from paycheck history: median gap between checks,
   // typical (median) amount, and the predicted next payday. Needs >= 3 checks.
   function paycheckPattern(paychecks) {
@@ -466,6 +587,8 @@
     ["xfinity", "Utilities"], ["spectrum", "Utilities"], ["cox ", "Utilities"],
     ["verizon", "Phone"], ["t-mobile", "Phone"], ["tmobile", "Phone"], ["at&t", "Phone"],
     ["kroger", "Groceries"], ["walmart", "Groceries"], ["aldi", "Groceries"],
+    ["h-e-b", "Groceries"], ["h e b ", "Groceries"],
+    ["application fee", "Housing"], ["admin fee", "Housing"], ["app fee", "Housing"],
     ["costco", "Groceries"], ["trader joe", "Groceries"], ["publix", "Groceries"],
     ["safeway", "Groceries"], ["heb ", "Groceries"], ["wegmans", "Groceries"],
     ["whole foods", "Groceries"], ["grocery", "Groceries"], ["food lion", "Groceries"],
@@ -1387,23 +1510,39 @@
     for (const [cat, total] of Object.entries(catSpend)) {
       const named = items.filter((i) => i.category === cat).reduce((s, i) => s + i.monthly_avg, 0);
       const rest = total / nMonths - named;
-      if (rest >= 30) {
-        const [fraction, necessity] = CUT_RULES.tail;
-        const tail = Object.values(groups)
-          .filter((g) => g.category === cat && !items.some((i) => i.label === g.label))
-          .sort((a, b) => b.hits.reduce((s, h) => s + h[1], 0) - a.hits.reduce((s, h) => s + h[1], 0))
-          .slice(0, 3);
+      if (rest < 30) continue;
+      // the biggest ACTUAL charges, not aggregates — the user should see
+      // exactly what they spent and where
+      const leftoverHits = Object.values(groups)
+        .filter((g) => g.category === cat && !items.some((i) => i.label === g.label))
+        .flatMap((g) => g.hits)
+        .sort((a, b) => b[1] - a[1]);
+      const examples = leftoverHits.slice(0, 4).map((h) => exampleLine(h[3], h[2], h[1]));
+      if (cat === "Other") {
+        // spending the app can't classify is NOT cuttable by default — an
+        // apartment application fee is not a night out. Show the
+        // transactions and ask; count nothing as savings.
+        const [, necessity] = CUT_RULES.review;
         items.push({
-          action: "trim",
-          label: cat === "Other" ? "Misc one-offs" : `Other ${cat}`,
-          category: cat,
+          action: "review", label: "Unidentified spending", category: cat,
+          monthly_avg: r2(rest), suggested_cut: 0,
+          necessity, priority: 0,
+          per_month: null, months_seen: nMonths,
+          message: `$${Math.round(rest).toLocaleString("en-US")}/mo the app can't classify — ` +
+            "these may be necessities (fees, deposits). Categorize them or press Keep; " +
+            "nothing here is counted as savings",
+          examples,
+        });
+      } else {
+        const [fraction, necessity] = CUT_RULES.tail;
+        items.push({
+          action: "trim", label: `Other ${cat}`, category: cat,
           monthly_avg: r2(rest), suggested_cut: r2(rest * fraction),
           necessity,
           priority: cutPriority(rest * fraction, necessity, null),
           per_month: null, months_seen: nMonths,
-          message: `$${Math.round(rest).toLocaleString("en-US")}/mo of one-offs — aim 30% lower`,
-          examples: tail.map((g) =>
-            `${g.label} $${Math.round(g.hits.reduce((s, h) => s + h[1], 0) / nMonths)}/mo`),
+          message: `$${Math.round(rest).toLocaleString("en-US")}/mo of small ${cat.toLowerCase()} one-offs — aim 30% lower`,
+          examples,
         });
       }
     }
@@ -1716,7 +1855,12 @@
             };
           }
         }
-        return { budget, comparison: compareStrategies(debts, extra), extra_used: extra, advice };
+        const bankBalance = settings.bank_balance || "";
+        const forecast = cashFlowForecast(
+          bankBalance === "" ? 0 : Number(bankBalance),
+          budget.pattern, listBills(db), debts, db.goals || [], settings, todayISO());
+        forecast.balance_known = bankBalance !== "";
+        return { budget, comparison: compareStrategies(debts, extra), extra_used: extra, advice, forecast };
       }
 
       case "/api/transactions":
@@ -1925,6 +2069,6 @@
     // exposed for tests
     _internals: { buildPlan, simulatePayoff, spendingSummary, parseBankCsv, parseDebtsCsv,
       parseDebtsText, parseCreditReportText, parseStatementText, nextDueDate, estimateMonthlyExtra,
-      debtsMatch, consolidateDebts },
+      debtsMatch, consolidateDebts, cashFlowForecast, paycheckPattern },
   };
 })();

@@ -188,6 +188,13 @@ function renderActionPlan(p) {
     if (due < today) due.setMonth(due.getMonth() + 1);
     return due;
   };
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const f = p && p.forecast;
+  // cash-flow verification: every payment below was simulated day by day
+  // against predicted paychecks, the bank balance and daily essentials
+  const cov = {};
+  if (f) for (const it of f.items) cov[it.label + "|" + it.date] = it.covered;
+
   const steps = [];
   // past-due catch-ups come before everything — today, not on a due day
   for (const d of STATE.debts) {
@@ -200,14 +207,17 @@ function renderActionPlan(p) {
   for (const b of STATE.bills) {
     const owed = Math.max(0, b.amount - (b.reserved || 0));
     if (owed > 0.01) {
-      steps.push({ date: nextDue(b.due_day), badge: "bill", label: `Pay ${b.name}`,
+      const due = nextDue(b.due_day);
+      steps.push({ date: due, badge: "bill", label: `Pay ${b.name}`, fkey: `${b.name}|${iso(due)}`,
         amount: owed, note: b.reserved > 0.01 ? `${money(b.reserved)} already set aside` : b.category });
     }
   }
   for (const d of STATE.debts) {
     if (d.balance > 0.01 && d.min_payment > 0.01) {
-      steps.push({ date: nextDue(d.due_day), badge: "debt_min",
-        label: `Pay ${d.name} minimum`, amount: Math.min(d.min_payment, d.balance),
+      const due = nextDue(d.due_day);
+      steps.push({ date: due, badge: "debt_min",
+        label: `Pay ${d.name} minimum`, fkey: `${d.name} minimum|${iso(due)}`,
+        amount: Math.min(d.min_payment, d.balance),
         note: `${d.apr_estimated ? "~" : ""}${d.apr.toFixed(2)}% APR, ${money(d.balance)} left` });
     }
   }
@@ -215,8 +225,9 @@ function renderActionPlan(p) {
   for (const g of STATE.goals || []) {
     const needed = Math.max(0, g.amount - g.saved);
     if (needed > 0.01) {
-      steps.push({ date: new Date(g.due_date + "T00:00:00"), badge: "reserve",
-        label: `Have "${g.name}" money ready`, amount: g.amount,
+      const due = new Date(g.due_date + "T00:00:00");
+      steps.push({ date: due, badge: "reserve",
+        label: `Have "${g.name}" money ready`, fkey: `${g.name}|${iso(due)}`, amount: g.amount,
         note: `${money(g.saved)} of ${money(g.amount)} set aside — ${money(goalPerCheck(g))}/paycheck` });
     }
   }
@@ -227,10 +238,45 @@ function renderActionPlan(p) {
   }
   steps.sort((a, b) => a.date - b.date);
   const within30 = steps.filter((s) => s.badge === "reserve" || (s.date - today) / 86400000 <= 30);
-  let html = within30.map((s) => `<div class="plan-item">
+
+  // header: the mathematical verdict from the day-by-day simulation
+  let html = "";
+  if (f) {
+    if (!f.income_per_check) {
+      html += `<p class="muted small">Upload your pay stubs (Paycheck tab) so every payment below can be
+        verified against your actual paychecks, day by day.</p>`;
+    } else if (!f.balance_known) {
+      html += `<div class="warnbox">Set your <b>live bank balance</b> (first card above) — then every payment
+        below is verified day-by-day against your ~${money(f.income_per_check)} paychecks, and you'll see
+        exactly where money runs short.</div>`;
+    } else if (f.feasible) {
+      html += `<div class="okbox">✓ <b>Verified by cash-flow simulation:</b> starting from your
+        ${money(f.start_balance)} balance, with ~${money(f.income_per_check)} paychecks
+        (${f.checks_in_horizon} expected), every payment below is covered on time through
+        ${fmtDate(f.horizon_end)}. Projected balance then: ${money(f.end_balance)}.</div>`;
+    } else {
+      html += `<div class="warnbox">⚠ <b>Cash-flow check failed:</b> on <b>${fmtDate(f.first_shortfall.date)}</b>,
+        <b>${esc(f.first_shortfall.label)}</b> comes up <b>${money(f.first_shortfall.short)}</b> short.
+        Free up at least that much before then — the cuts below are sized for exactly this.</div>`;
+    }
+    if (f.past_due_total > 0 && f.income_per_check && f.balance_known) {
+      html += f.caught_up_by
+        ? `<div class="okbox">Following this plan you are <b>fully caught up</b> on the
+            ${money(f.past_due_total)} past due by <b>${fmtDate(f.caught_up_by)}</b> —
+            after that every dollar goes to payoff, not arrears.</div>`
+        : `<div class="warnbox">Even putting every spare dollar toward arrears, ${money(f.arrears_left)}
+            of the ${money(f.past_due_total)} past due is still unpaid ${fmtDate(f.horizon_end)} —
+            the cuts below shorten that.</div>`;
+    }
+  }
+
+  html += within30.map((s) => {
+    const covered = s.fkey ? cov[s.fkey] : undefined;
+    return `<div class="plan-item">
       <span class="badge ${s.badge}">${fmtDate(s.date.toISOString().slice(0, 10))}</span>
-      <span><span class="what">${esc(s.label)}</span><br><span class="why">${esc(s.note)}</span></span>
-      <span class="amt">${money(s.amount)}</span></div>`).join("");
+      <span><span class="what">${esc(s.label)}</span>${covered === false ? " <span class='badge debt_min'>⚠ short</span>" : covered === true ? " <span class='badge savings'>✓ covered</span>" : ""}<br><span class="why">${esc(s.note)}</span></span>
+      <span class="amt">${money(s.amount)}</span></div>`;
+  }).join("");
   // then: everything left goes to the strategy target
   const target = p && p.advice && p.advice.target_debt;
   const extra = p ? p.extra_used : STATE.budget.monthly_extra;

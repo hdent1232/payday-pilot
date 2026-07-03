@@ -17,6 +17,8 @@ DEFAULT_RULES = [
     ("xfinity", "Utilities"), ("spectrum", "Utilities"), ("cox ", "Utilities"),
     ("verizon", "Phone"), ("t-mobile", "Phone"), ("tmobile", "Phone"), ("at&t", "Phone"),
     ("kroger", "Groceries"), ("walmart", "Groceries"), ("aldi", "Groceries"),
+    ("h-e-b", "Groceries"), ("h e b ", "Groceries"),
+    ("application fee", "Housing"), ("admin fee", "Housing"), ("app fee", "Housing"),
     ("costco", "Groceries"), ("trader joe", "Groceries"), ("publix", "Groceries"),
     ("safeway", "Groceries"), ("heb ", "Groceries"), ("wegmans", "Groceries"),
     ("whole foods", "Groceries"), ("grocery", "Groceries"), ("food lion", "Groceries"),
@@ -1071,22 +1073,41 @@ def build_cut_plan(transactions, months=6, protected=None):
     for cat, total in cat_spend.items():
         named = sum(i["monthly_avg"] for i in items if i["category"] == cat)
         rest = total / n_months - named
-        if rest >= 30:
-            fraction, necessity = _CUT_RULES["tail"]
-            tail = sorted((g for g in groups.values()
-                           if g["category"] == cat and not any(i["label"] == g["label"] for i in items)),
-                          key=lambda g: -sum(a for _, a, _, _ in g["hits"]))[:3]
+        if rest < 30:
+            continue
+        # the biggest ACTUAL charges, not aggregates — the user should see
+        # exactly what they spent and where
+        leftover_hits = sorted(
+            (h for g in groups.values()
+             if g["category"] == cat and not any(i["label"] == g["label"] for i in items)
+             for h in g["hits"]),
+            key=lambda h: -h[1])
+        examples = [_example_line(d, desc, a) for _, a, desc, d in leftover_hits[:4]]
+        if cat == "Other":
+            # spending the app can't classify is NOT cuttable by default —
+            # an apartment application fee is not a night out. Show the
+            # transactions and ask; count nothing as savings.
+            fraction, necessity = _CUT_RULES["review"]
             items.append({
-                "action": "trim",
-                "label": "Misc one-offs" if cat == "Other" else f"Other {cat}",
-                "category": cat,
+                "action": "review", "label": "Unidentified spending", "category": cat,
+                "monthly_avg": round(rest, 2), "suggested_cut": 0,
+                "necessity": necessity, "priority": 0,
+                "per_month": None, "months_seen": n_months,
+                "message": f"${rest:,.0f}/mo the app can't classify — these may be "
+                           "necessities (fees, deposits). Categorize them or press Keep; "
+                           "nothing here is counted as savings",
+                "examples": examples,
+            })
+        else:
+            fraction, necessity = _CUT_RULES["tail"]
+            items.append({
+                "action": "trim", "label": f"Other {cat}", "category": cat,
                 "monthly_avg": round(rest, 2), "suggested_cut": round(rest * fraction, 2),
                 "necessity": necessity,
                 "priority": _cut_priority(rest * fraction, necessity, None),
                 "per_month": None, "months_seen": n_months,
-                "message": f"${rest:,.0f}/mo of one-offs — aim 30% lower",
-                "examples": [f"{g['label']} ${sum(a for _, a, _, _ in g['hits']) / n_months:,.0f}/mo"
-                             for g in tail],
+                "message": f"${rest:,.0f}/mo of small {cat.lower()} one-offs — aim 30% lower",
+                "examples": examples,
             })
 
     # essentials last: real money, but you need to eat and get to work, so
